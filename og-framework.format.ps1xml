@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<Configuration>
+  <ViewDefinitions>
+
+    <!-- Get-OgRepoStatus -->
+    <View>
+      <Name>OgRepoStatusTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.RepoStatus</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Name</Label><Width>32</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Branch</Label><Width>12</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Head</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Pinned</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>A/B</Label><Width>7</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>D</Label><Width>2</Width><Alignment>Center</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>PinStatus</Label><Width>14</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><ScriptBlock>$_.TreePrefix + $_.Name</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Branch</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Head</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Pinned</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($null -eq $_.Ahead) { '' } else { "$($_.Ahead)/$($_.Behind)" }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.Dirty) { '*' } else { '' }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>PinStatus</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- Sync-OgFramework -->
+    <View>
+      <Name>OgSyncResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.SyncResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>16</Width></TableColumnHeader>
+          <TableColumnHeader><Label>From</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>To</Label><Width>8</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>FromSha</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>ToSha</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- New-OgCommit -->
+    <View>
+      <Name>OgCommitResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.CommitResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>18</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Sha</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Pin</Label><Width>4</Width><Alignment>Center</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Message</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Sha</PropertyName></TableColumnItem>
+              <TableColumnItem><ScriptBlock>if ($_.ContainsPinAdvance) { '^' } else { '' }</ScriptBlock></TableColumnItem>
+              <TableColumnItem><PropertyName>Message</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- Push-OgFramework -->
+    <View>
+      <Name>OgPushResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.PushResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Branch</Label><Width>12</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>20</Width></TableColumnHeader>
+          <TableColumnHeader><Label>N</Label><Width>4</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>From</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>To</Label><Width>8</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Branch</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>CommitsPushed</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>FromSha</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>ToSha</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- Add-OgChange -->
+    <View>
+      <Name>OgAddResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.AddResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Files</Label><Width>6</Width><Alignment>Right</Alignment></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>18</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>FilesStaged</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- Show-OgDiff -->
+    <View>
+      <Name>OgDiffResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.DiffResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>10</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Error</Label></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Error</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+    <!-- Update-OgLibPin -->
+    <View>
+      <Name>OgPinUpdateResultTable</Name>
+      <ViewSelectedBy>
+        <TypeName>Og.PinUpdateResult</TypeName>
+      </ViewSelectedBy>
+      <TableControl>
+        <TableHeaders>
+          <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>14</Width></TableColumnHeader>
+          <TableColumnHeader><Label>OldPin</Label><Width>8</Width></TableColumnHeader>
+          <TableColumnHeader><Label>NewPin</Label><Width>8</Width></TableColumnHeader>
+        </TableHeaders>
+        <TableRowEntries>
+          <TableRowEntry>
+            <TableColumnItems>
+              <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>OldPin</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>NewPin</PropertyName></TableColumnItem>
+            </TableColumnItems>
+          </TableRowEntry>
+        </TableRowEntries>
+      </TableControl>
+    </View>
+
+  </ViewDefinitions>
+</Configuration>

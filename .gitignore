@@ -1,0 +1,9 @@
+# PowerShell test output
+TestResults/
+
+# Pester results
+*.xml
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,92 @@
+# Licensing — {{LICENSED_WORK}}
+
+This repository uses two licenses that apply to different parts of the code.
+The authoritative license for any file is its `SPDX-License-Identifier` header.
+When no header is present, the default license for the repository applies
+(see the table below).
+
+---
+
+## License overview
+
+| Part of the repository | License |
+|---|---|
+| {{BSL_SUBTREES}} | **BUSL-1.1** — see `LICENSE` |
+| {{MPL_SUBTREES}} | **MPL-2.0** — see `LICENSES/MPL-2.0.txt` |
+
+Full license texts are at the repository root:
+
+- `LICENSE` — Business Source License 1.1 (applies to brawler-specific code)
+- `LICENSES/MPL-2.0.txt` — Mozilla Public License Version 2.0 (applies to generic/sim code)
+
+---
+
+## What BUSL-1.1 means in plain English
+
+BUSL-1.1 is a *source-available* license, not an Open Source license.
+Here is what it lets you do and not do:
+
+**You can freely:**
+- Read, study, and experiment with the code.
+- Build and run the software for personal, educational, research, hobby,
+  or open-source purposes.
+- Build commercial products and services that are *not* competing products
+  (see the Additional Use Grant below).
+- Submit contributions back to {{LICENSOR}}.
+
+**You cannot (without a commercial license):**
+- Use the BUSL-1.1 code in a product or service whose *primary gameplay*
+  is multiplayer character-vs-character melee combat — a "Competing Product."
+
+**The code automatically becomes MPL-2.0 on the Change Date** printed in
+`LICENSE`. After that date, anyone may use the code under the full terms of
+the Mozilla Public License Version 2.0 with no restrictions from the BSL.
+
+### Additional Use Grant (plain English)
+
+You may use the Licensed Work in commercial software, including charging
+money, provided your product is not a Competing Product (a game where the
+core loop is multiplayer melee character-vs-character combat).
+
+Non-commercial use — personal projects, education, research, hobby work,
+open-source contributions — is always permitted regardless of genre.
+
+If you are unsure whether your use qualifies, or if you want to discuss a
+use that the grant does not clearly cover, please reach out.
+The Licensor actively welcomes these conversations and is open to granting
+case-by-case exceptions for novel or otherwise interesting uses.
+
+---
+
+## MPL-2.0 subtree
+
+The directories listed under MPL-2.0 above contain generic, simulation-layer
+code that has no dependency on brawler-specific gameplay. This code is
+intentionally kept separate so it can be extracted into a dedicated
+`og-simulation-unreal` repository in the future. Keeping it under MPL-2.0
+now means that extraction will not require any relicensing step.
+
+If you are building a game that is *not* a Competing Product, you can depend
+on or fork the MPL-2.0 subtree under the full terms of MPL-2.0 today.
+
+---
+
+## When the grant doesn't cover what you want to do
+
+The Additional Use Grant in `LICENSE` already invites you to reach out for
+unusual or unclear cases — please do. The same applies if you have a use that
+the grant clearly excludes (e.g., a Competing Product). Contact:
+
+**{{COMMERCIAL_CONTACT}}**
+
+Each request is considered on its own. There is no template, no price list,
+no presumption about what shape the arrangement should take.
+
+---
+
+## Summary for contributors
+
+- Files in the BUSL-1.1 subtrees carry `SPDX-License-Identifier: BUSL-1.1`.
+- Files in the MPL-2.0 subtrees carry `SPDX-License-Identifier: MPL-2.0`.
+- When adding a new file, match the SPDX header to the directory it lives in.
+- See `CONTRIBUTING.md` for the full contribution process and CLA requirements.

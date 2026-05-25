@@ -1,0 +1,113 @@
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+# Contributing to {{LICENSED_WORK}}
+
+## License overview
+
+This repository uses **two licenses** that apply to different parts of the code.
+**The `SPDX-License-Identifier` header in each source file is the authoritative
+statement of that file's license.** When no header is present, the following
+defaults apply:
+
+| Subtree | Default license |
+|---|---|
+| {{BSL_SUBTREES}} | **BUSL-1.1** — see `LICENSE` |
+| {{MPL_SUBTREES}} | **MPL-2.0** — see `LICENSES/MPL-2.0.txt` |
+
+See [`LICENSING.md`](LICENSING.md) for the full explanation of the split,
+what BUSL-1.1 permits, and commercial licensing contact information.
+
+Full license texts are at the repository root:
+- `LICENSE` — Business Source License 1.1
+- `LICENSES/MPL-2.0.txt` — Mozilla Public License Version 2.0
+
+## Adding new files
+
+**When you add a new file, copy the `SPDX-License-Identifier` header from a
+neighboring file in the same directory.** Do not choose a license arbitrarily —
+the directory you are working in determines which license applies by default.
+
+If you are unsure which license applies to a new file you are creating in a
+new or ambiguous location, open an issue or ask in the PR before submitting.
+
+## CLA requirement
+
+By contributing, you agree that your contributions are covered by the
+[Individual Contributor License Agreement (CLA)](https://github.com/og-framework/og-tools/blob/main/Public/license-templates/CLA-process.md).
+The CLA inbound license equals the `SPDX-License-Identifier` of the file you
+are modifying, and you grant **{{LICENSOR}}** the right to relicense your
+contribution under any OSI-approved or source-available license per Section 4
+of the CLA. You retain copyright ownership of your contributions.
+
+Before your first pull request is merged you must sign the CLA. See
+[`CLA-process.md`](https://github.com/og-framework/og-tools/blob/main/Public/license-templates/CLA-process.md) for the step-by-step signing flow.
+
+## Where to make your change
+
+The og-framework spans multiple repos. Use this decision tree to find the right
+starting point:
+
+---
+
+**"I want to fix a bug in the simulation core (physics, determinism, tick logic)"**
+→ Clone [og-tests-cmake-runner](https://github.com/og-framework/og-tests-cmake-runner) with `--recurse-submodules`.
+Iterate on `extern/og-simulation/`. Run `ctest` to verify.
+Pin-bump consumers (og-simulation-ue, og-brawler, etc.) once your change is merged and pushed.
+
+---
+
+**"I want to add a brawler hitbox feature, guard state, or input mapping"**
+→ Clone [og-tests-cmake-runner](https://github.com/og-framework/og-tests-cmake-runner) with `--recurse-submodules`.
+Iterate on `extern/og-brawler/`. Run `ctest` to verify.
+Pin-bump consumers (og-brawler-ue, etc.) once merged.
+
+---
+
+**"I want to fix UE-specific code (Build.cs, .uplugin, UE module wrappers)"**
+→ Clone this repo ([og-brawler-unreal](https://github.com/og-framework/og-brawler-unreal)) with `--recurse-submodules`.
+Iterate in `Plugins/OGSimulation/` or `Plugins/OGBrawler/` (submodules of og-simulation-ue / og-brawler-ue).
+Build with `OGBrawlerUnrealEditor` to verify.
+
+---
+
+**"I want to write a new test"**
+→ Clone [og-tests-cmake-runner](https://github.com/og-framework/og-tests-cmake-runner) with `--recurse-submodules`.
+Add to `extern/og-simulation-tests/Source/OGSimulationTests/` or `extern/og-brawler-tests/Source/OGBrawlerTests/`.
+New `.cpp` files are glob-auto-picked up by CMake (`file(GLOB_RECURSE ... CONFIGURE_DEPENDS ...)`); no `CMakeLists.txt` edit needed.
+If the test exercises UE-side behavior, tag it with `[og]` so the `[@og]` Catch2 tag alias picks it up in LLT runs (see [`docs/low-level-tests.md`](docs/low-level-tests.md)).
+
+---
+
+**"I want to fix or extend the og-tools PowerShell cmdlets"**
+→ Clone [og-tools](https://github.com/og-framework/og-tools) directly. Iterate; test by importing the module locally.
+Once merged and pushed, bump the `tools/og-tools` submodule pin in consumers:
+
+```powershell
+Import-Module C:\dev\og-tools\og-framework.psd1 -Force
+# From each consumer root (og-brawler-unreal, og-tests-cmake-runner):
+oggitsync   # advances tools/og-tools to latest origin/main
+oggitcommit -Message "Bump og-tools pin to vX.Y.Z"
+```
+
+---
+
+**"I want to add a new build system integration (Godot, Bazel, SCons)"**
+→ Create a new shell repo under `og-framework/` following the same pattern as og-simulation-ue / og-brawler-ue (`.uplugin` / build-system descriptor + `extern/<lib>/` submodule + no source duplication).
+
+---
+
+## Pull requests
+
+- Open an issue first for non-trivial changes so we can align on approach before
+  you invest time writing code.
+- Keep PRs focused: one logical change per PR.
+- Ensure the standalone CMake build and tests pass (`cmake --build build && ctest`)
+  before submitting.
+- If your change touches og-brawler-unreal, also verify the Editor target builds
+  and both LLT exes pass (`oglltest simulation`, `oglltest brawler`).
+- Add the correct `SPDX-License-Identifier` header to any new source files you
+  author — copy from a neighboring file in the same directory.
+
+## Issues
+
+Please include a minimal reproduction and the platform/compiler version when
+reporting bugs.
