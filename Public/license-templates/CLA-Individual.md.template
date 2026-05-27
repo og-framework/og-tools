@@ -1,7 +1,7 @@
 # Individual Contributor License Agreement
 
 > Adapted from the Apache Software Foundation Individual Contributor License Agreement v2.0.
-> Modifications: inbound license is per-file SPDX header (not a fixed license); added relicensing grant to Licensor.
+> Modifications: inbound license is per-file SPDX header (not a fixed license); added relicensing grant to Licensor (including proprietary/closed-source at Licensor's discretion).
 
 **Licensor:** {{LICENSOR}}
 
@@ -35,7 +35,7 @@ Subject to the terms and conditions of this Agreement, You hereby grant to the L
 
 ## 4. Relicensing Grant
 
-You additionally grant to the Licensor the right to relicense Your Contribution, in whole or in part, under any license that is either (a) approved by the Open Source Initiative (OSI) as an open source license, or (b) recognized as a "source-available" license by the Licensor, including but not limited to the Business Source License (BUSL). This relicensing right is granted irrevocably, is royalty-free, and is exercisable by the Licensor at any time and without further consent from You. This grant enables the Licensor to offer dual-licensing or to change the project's license posture in the future while continuing to distribute Your Contribution.
+You additionally grant to the Licensor the right to relicense Your Contribution, in whole or in part, under any license at the Licensor's sole discretion, including but not limited to: (a) any license approved by the Open Source Initiative (OSI) as an open source license; (b) any "source-available" license, including but not limited to the Business Source License (BUSL); and (c) any proprietary or closed-source license. This relicensing right is granted irrevocably, is royalty-free, and is exercisable by the Licensor at any time and without further consent from You. This grant enables the Licensor to offer dual-licensing, to change the project's license posture in the future (including switching to proprietary or closed-source distribution), and to commercialize the Work, while continuing to distribute Your Contribution under such terms.
 
 For clarity, this relicensing right does not affect Your own use of Your Contribution under the Inbound License, nor does it restrict You from licensing Your Contribution to others under the Inbound License or any other license of Your choosing.
 
