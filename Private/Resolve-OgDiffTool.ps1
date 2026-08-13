@@ -68,6 +68,25 @@ function Start-OgDiffToolProcess {
         substituted $LOCAL/$REMOTE (see Expand-OgDiffToolCommand); this function does not wait for
         the launched process, matching `git difftool`'s own fire-and-forget-to-a-single-instance-app
         behaviour.
+
+        ⛔ THE COMMAND LINE IS WRAPPED IN AN EXTRA QUOTE PAIR, AND IT MUST BE. `cmd.exe /c` applies
+        a documented quote-stripping rule when its command begins with a quote: it removes the
+        OUTER pair. A configured tool command almost always begins with a quoted executable path —
+        e.g.
+
+            difftool.diffinity.cmd = "C:\Program Files\Diffinity\Diffinity.exe" "$LOCAL" "$REMOTE"
+
+        — so passing it through unwrapped leaves cmd trying to execute `C:\Program`. It fails
+        instantly, and because `Start-Process` returns as soon as cmd is spawned (and the window is
+        hidden) NOTHING is visible: the caller happily reports 'opened' for every repo while no tool
+        ever ran. Wrapping restores the pair cmd consumes.
+
+        Measured on 2026-08-13 against a real Diffinity install, three arms:
+          unwrapped + hidden  -> 0 processes   (the shipped defect)
+          unwrapped + visible -> 0 processes   (so the window style was NOT the cause)
+          wrapped   + hidden  -> 1 process, window "base - head - Diffinity"  ✅
+        The middle arm is the one that matters: it rules out window style and isolates the fault to
+        cmd's quote handling. Do not "simplify" this back to a bare $CommandLine.
     #>
     [CmdletBinding()]
     param(
@@ -75,5 +94,8 @@ function Start-OgDiffToolProcess {
         [string] $CommandLine
     )
 
-    Start-Process -FilePath $env:ComSpec -ArgumentList @('/c', $CommandLine) -WindowStyle Hidden
+    # See the quote-stripping note above before touching this line.
+    Start-Process -FilePath $env:ComSpec `
+                  -ArgumentList @('/c', ('"' + $CommandLine + '"')) `
+                  -WindowStyle Hidden
 }
