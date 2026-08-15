@@ -28,9 +28,14 @@ function Invoke-Git {
     $proc.StartInfo = $psi
     $proc.Start() | Out-Null
 
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
+    # Drain both pipes concurrently BEFORE WaitForExit. Reading one stream to end while
+    # the other's OS pipe buffer fills (>~4KB) would deadlock a large git error dump
+    # (e.g. a merge/checkout refusal listing hundreds of files in a UE-sized repo).
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
     $proc.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
 
     [PSCustomObject]@{
         ExitCode         = $proc.ExitCode
