@@ -28,9 +28,21 @@ function Merge-OgToMain {
         the conflict by hand, then re-run: already-merged children report 'already-merged'
         (idempotent), so the cascade resumes where it stopped.
 
+        DOES NOT ADVANCE PINS. Each child is merged to its own MainBranch, creating a new
+        merge commit — but the parent's recorded pin still points at the FEATURE-branch SHA it
+        carried before (that reachability is exactly what deepest-first guarantees, and the
+        dirty guard below deliberately ignores the resulting gitlink modification so a
+        resume-after-conflict re-run is not refused). Run 'oggitadd; oggitcommit'
+        (New-OgCommit) after the cascade to advance every pin, then push. Skipping it leaves
+        main self-inconsistent: the content is identical, but a fresh clone's
+        'git submodule update' checks out feature-branch commits instead of each child's main
+        tip.
+
         DOES NOT PUSH. Like Push-OgFramework, this cmdlet is human-run and leaves each repo
         on MainBranch with the merge commit unpushed. Run 'oggitpush' (Push-OgFramework)
         afterward to push every main, children before the superproject.
+
+        FULL SEQUENCE: Merge-OgToMain -> oggitadd; oggitcommit -> oggitpush -> oggitstatus -Fetch
 
     .PARAMETER Branch
         The feature branch to merge into MainBranch (e.g. the name given to
