@@ -86,7 +86,24 @@ function Export-OgDiffAgainstDirDiff {
     $commandLine = Expand-OgDiffToolCommand -CommandTemplate $toolCommandTemplate `
         -LocalPath $basePath -RemotePath $headPath
     Write-Verbose "Launching exported directory diff in $($Repo.Path): $commandLine"
-    Start-OgDiffToolProcess -CommandLine $commandLine
+    $launch = Start-OgDiffToolProcess -CommandLine $commandLine
+
+    # A launch that did not start is NOT an 'opened' result. The export itself succeeded and its
+    # paths are still worth returning, but Action must never claim a window the user never saw.
+    if ($null -ne $launch -and -not $launch.Launched) {
+        $launchError = if ($launch.Detail) { $launch.Detail } else { 'The diff tool failed to launch.' }
+        Write-Warning "Diff tool failed to launch in '$($Repo.Path)': $launchError"
+        return [PSCustomObject]@{ PSTypeName = 'Og.DiffResult';
+            Repo     = $Repo.Name
+            Path     = $Repo.Path
+            Action   = 'failed'
+            Error    = $launchError
+            Ref      = $Against
+            Range    = $Range
+            BasePath = $basePath
+            HeadPath = $headPath
+        }
+    }
 
     [PSCustomObject]@{ PSTypeName = 'Og.DiffResult';
         Repo     = $Repo.Name
