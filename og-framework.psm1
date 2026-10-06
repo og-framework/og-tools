@@ -17,5 +17,6 @@ Set-Alias -Name oggitmerge    -Value Merge-OgToMain
 Set-Alias -Name oggitdiff     -Value Show-OgDiff
 Set-Alias -Name oglltest      -Value Invoke-OgLowLevelTest
 Set-Alias -Name oglicstamp    -Value Update-LicenseChangeDate
+Set-Alias -Name ogsteampublish -Value Publish-OgSteamBuild
 
-Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp
+Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp, ogsteampublish

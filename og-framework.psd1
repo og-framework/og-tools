@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 @{
     RootModule        = 'og-framework.psm1'
-    ModuleVersion     = '1.1.1'
+    ModuleVersion     = '1.3.0'
     GUID              = '70abd67b-8e61-465d-a290-641a2265916e'
     Author            = 'Grahnen92'
     Description       = 'Cross-repo PowerShell toolkit for the og-framework submodule workflow'
@@ -10,11 +10,15 @@
     FunctionsToExport = @(
         'Add-OgChange'
         'Get-OgRepoStatus'
+        'Install-OgSteamCmd'
         'Invoke-OgLowLevelTest'
+        'Invoke-OgUnrealPackage'
         'Merge-OgToMain'
         'New-OgCloneScenario'
         'New-OgCommit'
+        'New-OgDedicatedServerLauncher'
         'New-OgFeatureBranch'
+        'Publish-OgSteamBuild'
         'Push-OgFramework'
         'Show-OgDiff'
         'Sync-OgFramework'
@@ -33,6 +37,7 @@
         'oggitdiff'
         'oglltest'
         'oglicstamp'
+        'ogsteampublish'
     )
 
     CmdletsToExport   = @()
