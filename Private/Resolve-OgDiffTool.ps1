@@ -57,36 +57,26 @@ function Expand-OgDiffToolCommand {
     $CommandTemplate.Replace('$LOCAL', $LocalPath).Replace('$REMOTE', $RemotePath)
 }
 
-function Start-OgDiffToolProcess {
+function Get-OgDiffToolArgumentList {
     <#
     .SYNOPSIS
-        Launches an already-composed external diff tool command line.
+        Composes the cmd.exe argument vector for an already-expanded diff tool command line.
 
     .DESCRIPTION
-        Thin seam around process launch so Pester can mock this single function and never spawn a
-        real GUI tool -- there is no display in the test environment. Callers must have already
-        substituted $LOCAL/$REMOTE (see Expand-OgDiffToolCommand); this function does not wait for
-        the launched process, matching `git difftool`'s own fire-and-forget-to-a-single-instance-app
-        behaviour.
+        PURE and side-effect free, and kept separate from Start-OgDiffToolProcess ON PURPOSE: the
+        composition is the part that was wrong, and a test that mocks the spawn seam cannot see it.
 
-        ⛔ THE COMMAND LINE IS WRAPPED IN AN EXTRA QUOTE PAIR, AND IT MUST BE. `cmd.exe /c` applies
-        a documented quote-stripping rule when its command begins with a quote: it removes the
-        OUTER pair. A configured tool command almost always begins with a quoted executable path —
-        e.g.
+        cmd.exe STRIPS THE FIRST AND LAST QUOTE when the command line begins with a quote -- which
+        this one always does, because `difftool.<tool>.cmd` quotes the tool path:
 
-            difftool.diffinity.cmd = "C:\Program Files\Diffinity\Diffinity.exe" "$LOCAL" "$REMOTE"
+            "C:\Program Files\Diffinity\Diffinity.exe" "<base>" "<head>"
 
-        — so passing it through unwrapped leaves cmd trying to execute `C:\Program`. It fails
-        instantly, and because `Start-Process` returns as soon as cmd is spawned (and the window is
-        hidden) NOTHING is visible: the caller happily reports 'opened' for every repo while no tool
-        ever ran. Wrapping restores the pair cmd consumes.
+        Under a plain /c, cmd removes that outer pair, mangles the line and exits 1. /s plus an
+        extra wrapping pair tells cmd to take everything between the outer quotes verbatim.
 
-        Measured on 2026-08-13 against a real Diffinity install, three arms:
-          unwrapped + hidden  -> 0 processes   (the shipped defect)
-          unwrapped + visible -> 0 processes   (so the window style was NOT the cause)
-          wrapped   + hidden  -> 1 process, window "base - head - Diffinity"  ✅
-        The middle arm is the one that matters: it rules out window style and isolates the fault to
-        cmd's quote handling. Do not "simplify" this back to a bare $CommandLine.
+        MEASURED 2026-09-09 against the real tool and the real exported trees:
+            cmd /c  <line>     -> exit 1, nothing launches
+            cmd /s /c "<line>" -> Diffinity.exe appears in tasklist
     #>
     [CmdletBinding()]
     param(
@@ -94,8 +84,84 @@ function Start-OgDiffToolProcess {
         [string] $CommandLine
     )
 
-    # See the quote-stripping note above before touching this line.
-    Start-Process -FilePath $env:ComSpec `
-                  -ArgumentList @('/c', ('"' + $CommandLine + '"')) `
-                  -WindowStyle Hidden
+    # NOTE: parenthesise the concatenation. PowerShell's comma operator binds TIGHTER than '+',
+    # so @('/s', '/c', '"' + $CommandLine + '"') parses as @('/s','/c','"') + $CommandLine + '"'
+    # -- a FIVE element array that splits the quotes away from the command line. Measured.
+    $quoted = '"' + $CommandLine + '"'
+    @('/s', '/c', $quoted)
+}
+
+function Start-OgDiffToolProcess {
+    <#
+    .SYNOPSIS
+        Launches an already-composed external diff tool command line and reports whether it started.
+
+    .DESCRIPTION
+        Thin seam around process launch so Pester can mock this single function and never spawn a
+        real GUI tool -- there is no display in the test environment. Callers must have already
+        substituted $LOCAL/$REMOTE (see Expand-OgDiffToolCommand).
+
+        DOES NOT WAIT FOR THE TOOL, matching `git difftool`'s own
+        fire-and-forget-to-a-single-instance-app behaviour -- but it does wait a bounded moment so
+        that a launch which fails IMMEDIATELY is still observable, which is the only launch failure
+        a fire-and-forget caller can detect at all. A mangled command line or a missing exe makes
+        cmd exit within milliseconds; a real GUI tool outlives the window comfortably. So:
+
+            exited inside the window with a non-zero code -> Launched = $false
+            still running, or exited 0                    -> Launched = $true
+
+        WHY THIS EXISTS: the previous version passed -WindowStyle Hidden with no -PassThru and no
+        exit-code check, so a hard launch failure was invisible twice over -- cmd's error went to a
+        hidden window, and the caller reported Action = 'opened' regardless. A status that names an
+        outcome while testing nothing is worse than no status at all.
+
+    .OUTPUTS
+        PSCustomObject with Launched (bool), ExitCode (int or $null) and Detail (string or $null).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $CommandLine,
+
+        # Bounded fail-fast window: long enough that a mangled line has certainly exited, short
+        # enough that a successful launch is never meaningfully waited on.
+        [int] $FailFastMilliseconds = 1500
+    )
+
+    $arguments = Get-OgDiffToolArgumentList -CommandLine $CommandLine
+
+    try {
+        $process = Start-Process -FilePath $env:ComSpec -ArgumentList $arguments `
+            -WindowStyle Hidden -PassThru -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{
+            Launched = $false
+            ExitCode = $null
+            Detail   = "Start-Process failed: $($_.Exception.Message)"
+        }
+    }
+
+    if ($null -eq $process) {
+        return [PSCustomObject]@{
+            Launched = $false
+            ExitCode = $null
+            Detail   = 'Start-Process returned no process object.'
+        }
+    }
+
+    $null = $process.WaitForExit($FailFastMilliseconds)
+
+    if ($process.HasExited -and $process.ExitCode -ne 0) {
+        return [PSCustomObject]@{
+            Launched = $false
+            ExitCode = $process.ExitCode
+            Detail   = "The diff tool command exited $($process.ExitCode) immediately: $CommandLine"
+        }
+    }
+
+    [PSCustomObject]@{
+        Launched = $true
+        ExitCode = $(if ($process.HasExited) { $process.ExitCode } else { $null })
+        Detail   = $null
+    }
 }

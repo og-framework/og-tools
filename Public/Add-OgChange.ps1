@@ -23,6 +23,20 @@ function Add-OgChange {
         Explicit switch that mirrors the default behavior (stage all dirty repos).
         Provided for clarity in scripts; has no additional effect when -Path is absent.
 
+    .PARAMETER IntentToAdd
+        Pass `-N` to git add instead of staging content. Registers files as
+        "intended to be added" without staging any content — the working-tree
+        contents stay unstaged, but git diff (and therefore git difftool /
+        oggitdiff -DirDiff) starts treating them as new files with empty
+        baselines. Useful before running `oggitdiff -DirDiff` so the directory
+        diff includes untracked files in its right pane.
+
+        Reversible: `git reset HEAD -- <file>` in the owning repo removes the
+        intent-to-add entry without touching working-tree content. A subsequent
+        plain `oggitadd` finalises the staging when you're ready to commit.
+
+        Alias: -N (matches `git add -N`).
+
     .PARAMETER ProjectRoot
         Path to the project root. Defaults to the current working directory.
 
@@ -39,6 +53,14 @@ function Add-OgChange {
         # Stages only the owning repo (og-simulation) for that specific file.
 
     .EXAMPLE
+        # Make untracked files visible to a directory diff:
+        oggitadd -IntentToAdd
+        oggitdiff -DirDiff
+        # The diff's right pane now includes new files alongside modified ones.
+        # When ready to commit: `oggitadd` (no flag) finalises content staging.
+        # To undo without committing: `git reset HEAD -- <file>` in each repo.
+
+    .EXAMPLE
         # Canonical workflow:
         oggitadd
         oggitcommit -Message "feat: add position prediction to simulation"
@@ -46,7 +68,7 @@ function Add-OgChange {
 
     .OUTPUTS
         PSCustomObject — one per repo touched:
-          Repo, Path, FilesStaged (int), Action ('staged'|'nothing-to-stage'|'failed')
+          Repo, Path, FilesStaged (int), Action ('staged'|'intent-added'|'nothing-to-stage'|'would-stage'|'failed')
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -54,6 +76,9 @@ function Add-OgChange {
         [string[]] $Path,
 
         [switch] $All,
+
+        [Alias('N')]
+        [switch] $IntentToAdd,
 
         [string] $ProjectRoot = (Get-Location).Path
     )
@@ -104,8 +129,18 @@ function Add-OgChange {
                 $normalised.Substring($ownerRelPath.Length).TrimStart('/')
             }
 
-            $reposToStage.Add(@{ Node = $ownerNode; AddArgs = @('add', $fileRelToOwner) })
+            $addArgs = if ($IntentToAdd) {
+                @('add', '-N', $fileRelToOwner)
+            } else {
+                @('add', $fileRelToOwner)
+            }
+            $reposToStage.Add(@{ Node = $ownerNode; AddArgs = $addArgs })
         }
+
+        # Action label for successful adds — switches between 'staged' (content
+        # written to index) and 'intent-added' (-N: index entry registered, no
+        # content staged) so callers can distinguish the two.
+        $stagedActionLabel = if ($IntentToAdd) { 'intent-added' } else { 'staged' }
 
         foreach ($entry in $reposToStage) {
             $node    = $entry.Node
@@ -118,7 +153,11 @@ function Add-OgChange {
             }
 
             $target = if ($node.Path) { "$name ($($node.Path))" } else { $name }
-            if (-not $PSCmdlet.ShouldProcess($target, "git add $($entry.AddArgs[1])")) {
+            # Reconstruct the full git command for the ShouldProcess prompt (e.g.
+            # "git add -N path/to/file" when -IntentToAdd, "git add path/to/file"
+            # otherwise).
+            $opDesc = 'git ' + ($entry.AddArgs -join ' ')
+            if (-not $PSCmdlet.ShouldProcess($target, $opDesc)) {
                 [PSCustomObject]@{ PSTypeName = 'Og.AddResult';
                     Repo        = $name
                     Path        = $node.Path
@@ -140,7 +179,10 @@ function Add-OgChange {
                 continue
             }
 
-            # Count newly staged files
+            # Count files newly visible in the cached diff. With -N these are
+            # intent-to-add entries (empty content); with plain add they are real
+            # staged content. Either way, the count reflects what's now in the
+            # index.
             $diffResult  = Invoke-Git -WorkingDirectory $absPath -Arguments 'diff', '--cached', '--name-only'
             $filesStaged = if ($diffResult.ExitCode -eq 0 -and $diffResult.StdOut) {
                 ($diffResult.StdOut -split "`n" | Where-Object { $_ -ne '' }).Count
@@ -150,11 +192,19 @@ function Add-OgChange {
                 Repo        = $name
                 Path        = $node.Path
                 FilesStaged = $filesStaged
-                Action      = if ($filesStaged -gt 0) { 'staged' } else { 'nothing-to-stage' }
+                Action      = if ($filesStaged -gt 0) { $stagedActionLabel } else { 'nothing-to-stage' }
             }
         }
     } else {
         # Default mode: stage all dirty repos
+        # With -IntentToAdd we run `git add -N -A` (every untracked file gets an
+        # intent-to-add index entry; already-tracked-but-modified files are a
+        # no-op for -N since intent is implicit). Without -IntentToAdd it's the
+        # canonical `git add -A` (full content staging).
+        $addArgs           = if ($IntentToAdd) { @('add', '-N', '-A') } else { @('add', '-A') }
+        $opDesc            = 'git ' + ($addArgs -join ' ')
+        $stagedActionLabel = if ($IntentToAdd) { 'intent-added' } else { 'staged' }
+
         foreach ($node in $tree) {
             $absPath = $node.AbsolutePath
             $name    = $node.Name
@@ -164,7 +214,11 @@ function Add-OgChange {
                 continue
             }
 
-            # Check dirty state (working tree, not index)
+            # Check dirty state (working tree, not index). `git status
+            # --porcelain=v2` reports both tracked changes AND untracked files,
+            # so a repo with only untracked content still counts as dirty —
+            # important for the -IntentToAdd flow where the typical reason to
+            # run is precisely those untracked files.
             $statusResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'status', '--porcelain=v2'
             $isDirty = $statusResult.ExitCode -eq 0 -and ($statusResult.StdOut -ne '')
             if (-not $isDirty) {
@@ -178,7 +232,7 @@ function Add-OgChange {
             }
 
             $target = if ($node.Path) { "$name ($($node.Path))" } else { $name }
-            if (-not $PSCmdlet.ShouldProcess($target, 'git add -A')) {
+            if (-not $PSCmdlet.ShouldProcess($target, $opDesc)) {
                 [PSCustomObject]@{ PSTypeName = 'Og.AddResult';
                     Repo        = $name
                     Path        = $node.Path
@@ -188,9 +242,9 @@ function Add-OgChange {
                 continue
             }
 
-            $addResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'add', '-A'
+            $addResult = Invoke-Git -WorkingDirectory $absPath -Arguments $addArgs
             if ($addResult.ExitCode -ne 0) {
-                Write-Error "git add -A failed in '$name': $($addResult.StdErr)"
+                Write-Error "$opDesc failed in '$name': $($addResult.StdErr)"
                 [PSCustomObject]@{ PSTypeName = 'Og.AddResult';
                     Repo        = $name
                     Path        = $node.Path
@@ -209,7 +263,7 @@ function Add-OgChange {
                 Repo        = $name
                 Path        = $node.Path
                 FilesStaged = $filesStaged
-                Action      = if ($filesStaged -gt 0) { 'staged' } else { 'nothing-to-stage' }
+                Action      = if ($filesStaged -gt 0) { $stagedActionLabel } else { 'nothing-to-stage' }
             }
         }
     }

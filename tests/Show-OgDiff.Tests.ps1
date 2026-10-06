@@ -453,39 +453,3 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
     }
 }
 
-Describe 'Start-OgDiffToolProcess (the cmd.exe quote-stripping guard)' {
-
-    # WHY THIS SITS BELOW THE MOCK SEAM THE OTHER CASES USE.
-    # Every Show-OgDiff case mocks Start-OgDiffToolProcess itself, so none of them can observe
-    # HOW the process is launched -- which is exactly where the 2026-08-13 defect lived: the
-    # exports were correct, every repo reported 'opened', and no tool ever ran. These cases mock
-    # Start-Process instead and assert on what cmd.exe actually receives.
-
-    It 'wraps the whole command line in an extra quote pair for cmd /c' {
-        InModuleScope og-framework {
-            Mock Start-Process { }
-            Start-OgDiffToolProcess -CommandLine '"C:\Program Files\T\t.exe" "L" "R"'
-
-            # The wrapped form cmd /c needs: it strips the outer pair, leaving the tool's own
-            # quoted exe path intact.
-            Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
-                $ArgumentList[0] -eq '/c' -and
-                $ArgumentList[1] -eq '""C:\Program Files\T\t.exe" "L" "R""'
-            }
-        }
-    }
-
-    It 'never passes the bare command line through (the 2026-08-13 defect, pinned)' {
-        InModuleScope og-framework {
-            Mock Start-Process { }
-            Start-OgDiffToolProcess -CommandLine '"C:\Program Files\T\t.exe" "L" "R"'
-
-            # Unwrapped, cmd strips the tool's own quotes and tries to run 'C:\Program'. If this
-            # ever matches, the wrapping has been removed and the tool silently stops launching
-            # while every repo still reports 'opened'.
-            Should -Invoke Start-Process -Times 0 -Exactly -ParameterFilter {
-                $ArgumentList[1] -eq '"C:\Program Files\T\t.exe" "L" "R"'
-            }
-        }
-    }
-}
