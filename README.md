@@ -78,14 +78,17 @@ Get-Command -Module og-framework | Select-Object Name, CommandType
 | Cmdlet | Alias | Purpose |
 |--------|-------|---------|
 | `Get-OgRepoStatus` | `oggitstatus` | Read tree state (PSObjects per repo) |
-| `Sync-OgFramework` | `oggitsync` | Fetch + ff-merge cascade deepest-first |
-| `Add-OgChange` | `oggitadd` | Stage changes across the tree |
+| `Sync-OgFramework` | `oggitsync` | Fetch + ff-merge cascade deepest-first; initialises new submodules; `-Branch` syncs a feature branch instead of main |
+| `Add-OgChange` | `oggitadd` | Stage changes across the tree; skips (with a warning) nested repos not declared in `.gitmodules` |
 | `New-OgCommit` | `oggitcommit` | Commit + auto pin-advance cascade |
-| `Push-OgFramework` | `oggitpush` | Push with `--recurse-submodules=on-demand` |
+| `Push-OgFramework` | `oggitpush` | Push every repo deepest-first; `-u` for a branch new on origin |
+| `Merge-OgToMain` | `oggitmerge` | Merge a feature branch into main deepest-first; initialises submodules new on main |
+| `Add-OgSubmodule` | `oggitsubadd` | Add a repo as a submodule in the repo that owns the path, on the owner's feature branch; staged, not committed |
+| `Remove-OgSubmodule` | `oggitsubrm` | Retire a submodule (deinit, `git rm`, clean `.git/modules`); staged, not committed; refuses on unpushed work |
 | `Update-LicenseChangeDate` | `oglicstamp` | Stamp BSL Change Date at release time |
 | `Update-OgLibPin` | — | Niche: pin a submodule to a specific historical SHA |
-| `New-OgFeatureBranch` | — | Cross-repo branch creation |
-| `New-OgCloneScenario` | — | Scenario clone (simulation/brawler/unreal/cmake-runner) |
+| `New-OgFeatureBranch` | — | Cross-repo branch creation; re-runnable (existing branches are skipped quietly); `-Repo` filter |
+| `New-OgCloneScenario` | — | Scenario clone (simulation/brawler/unreal/cmake-runner); `-Branch` checks out a feature branch |
 | `Test-OgPinConsistency` | — | CI validation; sets exit code 0/1 |
 | `Publish-OgSteamBuild` | `ogsteampublish` | Package every depot, write SteamPipe VDFs, upload with steamcmd ([Steam publishing](#steam-publishing)) |
 | `Invoke-OgUnrealPackage` | — | UAT BuildCookRun wrapper for one Win64 Client/Server/Game target |
@@ -125,6 +128,58 @@ one commit per `oggitcommit` call.
 
 ---
 
+## Adding (and retiring) a repo on a feature branch
+
+A new repo joins the tree as a submodule **on the feature branch**, so `main` never
+references it until the feature merges. Example: `og-simulation-jolt` inside
+og-simulation-ue, with every repo on `feat/jolt-scheduler`.
+
+```powershell
+# 1. On GitHub, create the repo WITH an initial commit (README or LICENSE), so 'main' exists.
+#    oggitsubadd refuses a remote without 'main'.
+
+# 2. Add it. The owner is the deepest repo containing the path (here og-simulation-ue);
+#    the new submodule gets the owner's branch, created from its main.
+oggitsubadd -Url https://github.com/og-framework/og-simulation-jolt.git `
+            -Path Plugins/OGSimulation/Source/OGSimulationJolt/og-simulation-jolt
+
+# 3. Commit (.gitmodules + gitlink in the owner, then the pin cascade) and push.
+#    The new repo's branch is pushed first, with -u.
+oggitcommit -Message "Add og-simulation-jolt submodule"
+oggitpush
+
+# Other clones: fetch, initialise the new submodule, and stay on the feature branch.
+oggitsync -Branch feat/jolt-scheduler
+
+# A fresh clone of the branch (the unreal scenario includes og-simulation-jolt):
+New-OgCloneScenario -Scenario unreal -Target C:\dev\scratch -Branch feat/jolt-scheduler
+```
+
+Things that make this safe:
+
+- `oggitadd` skips a directory that has its own `.git` but is not declared in that
+  repo's `.gitmodules` (for example the new repo left on disk after checking out
+  `main`), and warns. Otherwise git would stage it as an embedded gitlink with no
+  `.gitmodules` entry.
+- `New-OgFeatureBranch` can be re-run after a submodule joins: repos that already have
+  the branch are skipped quietly. `-Repo <name-or-path>` targets one repo.
+- `oggitmerge` initialises submodules that are new on `main` after the merge cascade.
+
+**Retiring a repo.** On the feature branch alone, just do not merge it. If the
+submodule ever reached `main`:
+
+```powershell
+# Refuses if the submodule (or anything nested in it) has uncommitted or unpushed work; -Force overrides.
+oggitsubrm -Path Plugins/OGSimulation/Source/OGSimulationJolt/og-simulation-jolt
+oggitcommit -Message "Retire og-simulation-jolt"
+oggitpush
+```
+
+Then archive the GitHub repo (read-only). Do not delete it: pins in the branch history
+must keep resolving.
+
+---
+
 ## Pipeline composition examples
 
 ```powershell
@@ -150,9 +205,11 @@ Get-OgRepoStatus | Where-Object { $_.Ahead -gt 0 } | Format-Table Name, Ahead, H
 
 ## Note on `git push --recurse-submodules`
 
-`Push-OgFramework` (`oggitpush`) is a thin wrapper around
-`git push --recurse-submodules=on-demand`. If you prefer to manage push directly,
-set this git option globally and skip the alias:
+`Push-OgFramework` (`oggitpush`) does not use `git push --recurse-submodules=on-demand`,
+which only descends one level. It walks the tree deepest-first and pushes each repo with
+unpushed commits, stopping at the first failure, and uses `git push -u` for a branch that
+origin does not have yet. If you prefer to manage push directly for a shallow tree, set
+this git option globally and skip the alias:
 
 ```powershell
 git config --global push.recurseSubmodules on-demand

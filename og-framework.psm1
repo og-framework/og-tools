@@ -11,6 +11,8 @@ Export-ModuleMember -Function ($public | ForEach-Object { $_.BaseName })
 Set-Alias -Name oggitstatus   -Value Get-OgRepoStatus
 Set-Alias -Name oggitsync     -Value Sync-OgFramework
 Set-Alias -Name oggitadd      -Value Add-OgChange
+Set-Alias -Name oggitsubadd   -Value Add-OgSubmodule
+Set-Alias -Name oggitsubrm    -Value Remove-OgSubmodule
 Set-Alias -Name oggitcommit   -Value New-OgCommit
 Set-Alias -Name oggitpush     -Value Push-OgFramework
 Set-Alias -Name oggitmerge    -Value Merge-OgToMain
@@ -19,4 +21,4 @@ Set-Alias -Name oglltest      -Value Invoke-OgLowLevelTest
 Set-Alias -Name oglicstamp    -Value Update-LicenseChangeDate
 Set-Alias -Name ogsteampublish -Value Publish-OgSteamBuild
 
-Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp, ogsteampublish
+Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitsubadd, oggitsubrm, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp, ogsteampublish

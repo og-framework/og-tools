@@ -157,3 +157,57 @@ Describe 'Merge-OgToMain (single-repo behaviours)' {
         }
     }
 }
+
+Describe 'Merge-OgToMain (post-merge submodule init)' {
+    BeforeAll {
+        . "$PSScriptRoot\OgGitTestHelpers.ps1"
+        Enter-OgGitSandbox -Root (Join-Path $TestDrive 'sandbox')
+    }
+    AfterAll {
+        Exit-OgGitSandbox
+    }
+
+    It 'initialises a submodule that is new on main after the cascade and reports it' {
+        $p      = New-TestProject
+        $newUrl = New-TestRemote -Root $p.Remotes -Name 'newlib'
+
+        # The feature branch adds a submodule; this clone then forgets it locally (as a
+        # clone that never initialised it would be), so after the merge it is declared on
+        # main but not on disk.
+        Invoke-TestGit $p.Project checkout -q -b feat/x | Out-Null
+        Invoke-TestGit $p.Project submodule add -q -- $newUrl libs/newlib | Out-Null
+        Invoke-TestGit $p.Project commit -q -m 'add newlib' | Out-Null
+        Invoke-TestGit $p.Project submodule deinit -q -f -- libs/newlib | Out-Null
+        Remove-Item -LiteralPath (Join-Path $p.Project '.git/modules/libs/newlib') -Recurse -Force
+        Invoke-TestGit $p.Project checkout -q main | Out-Null
+
+        $results = @(Merge-OgToMain -Branch feat/x -ProjectRoot $p.Project -WarningAction SilentlyContinue)
+
+        ($results | Where-Object Path -eq '').Action | Should -Be 'merged'
+        $init = $results | Where-Object Path -eq 'libs/newlib'
+        $init.Action | Should -Be 'initialised'
+        $init.Branch | Should -Be 'main'
+        $init.ToSha  | Should -Not -BeNullOrEmpty
+        Test-Path (Join-Path $p.Project 'libs/newlib/.git')     | Should -BeTrue
+        Test-Path (Join-Path $p.Project 'libs/newlib/README.md') | Should -BeTrue
+    }
+
+    It 'does not initialise anything when the cascade halts' {
+        $p      = New-TestProject
+        $newUrl = New-TestRemote -Root $p.Remotes -Name 'newlib'
+        Invoke-TestGit $p.Project checkout -q -b feat/x | Out-Null
+        Invoke-TestGit $p.Project submodule add -q -- $newUrl libs/newlib | Out-Null
+        Set-Content -LiteralPath (Join-Path $p.Project 'clash.txt') -Value 'feature'
+        Invoke-TestGit $p.Project add clash.txt | Out-Null
+        Invoke-TestGit $p.Project commit -q -m 'add newlib + clash' | Out-Null
+        Invoke-TestGit $p.Project submodule deinit -q -f -- libs/newlib | Out-Null
+        Remove-Item -LiteralPath (Join-Path $p.Project '.git/modules/libs/newlib') -Recurse -Force
+        Invoke-TestGit $p.Project checkout -q main | Out-Null
+        Add-TestCommit -Dir $p.Project -File 'clash.txt' -Content 'main' -Message 'main clash'
+
+        $results = @(Merge-OgToMain -Branch feat/x -ProjectRoot $p.Project -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+
+        ($results | Where-Object Path -eq '').Action        | Should -Be 'conflict'
+        ($results | Where-Object Path -eq 'libs/newlib')    | Should -BeNullOrEmpty
+    }
+}

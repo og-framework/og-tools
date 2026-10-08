@@ -14,6 +14,14 @@ function Add-OgChange {
         Does NOT pre-stage pin advances — that is New-OgCommit's job, which stages
         each parent's submodule pointer update after committing the child.
 
+        EMBEDDED-REPO GUARD: before staging in a repo, the cmdlet looks for untracked
+        directories that hold their own '.git' but are NOT declared in that repo's
+        .gitmodules (for example a submodule that exists only on a feature branch, left on
+        disk after checking out main). Each one is excluded from the add with a
+        ':(exclude)<path>' pathspec and named in a warning. Without the guard git would
+        stage it as an embedded gitlink with no .gitmodules entry, a pin no other clone can
+        resolve. Use Add-OgSubmodule (oggitsubadd) to add such a repo properly.
+
     .PARAMETER Path
         Optional. Relative path(s) from the project root. When specified, only stages
         changes within the repo(s) that own the given paths. Paths may refer to files
@@ -86,6 +94,20 @@ function Add-OgChange {
     $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).ProviderPath
     $tree = @(Resolve-OgRepoTree -ProjectRoot $ProjectRoot)
 
+    # Embedded-repo guard: returns ':(exclude)<path>' pathspecs for every undeclared nested
+    # repo in the repo at $absPath (limited to those inside $scope, a repo-relative path,
+    # when given) and warns once per path.
+    $embeddedRepoExcludes = {
+        param([string] $absPath, [string] $label, [string] $scope)
+        foreach ($nested in @(Get-OgUndeclaredNestedRepo -RepoPath $absPath)) {
+            if ($scope -and $scope -ne '.' -and
+                -not ($nested -eq $scope -or $nested.StartsWith($scope.TrimEnd('/') + '/'))) { continue }
+            Write-Warning ("Skipping '$nested' in '$label': it contains its own .git but is not declared in .gitmodules, " +
+                "so git would stage it as an embedded gitlink. Add it with oggitsubadd, or move it out of the tree.")
+            ":(exclude)$nested"
+        }
+    }
+
     if ($Path -and $Path.Count -gt 0) {
         # Path-scoped mode: for each path find the owning repo (deepest match)
         $reposToStage = [System.Collections.Generic.List[hashtable]]::new()
@@ -130,9 +152,12 @@ function Add-OgChange {
             }
 
             $addArgs = if ($IntentToAdd) {
-                @('add', '-N', $fileRelToOwner)
+                @('add', '-N', '--', $fileRelToOwner)
             } else {
-                @('add', $fileRelToOwner)
+                @('add', '--', $fileRelToOwner)
+            }
+            if (Test-Path -LiteralPath $ownerNode.AbsolutePath) {
+                $addArgs += @(& $embeddedRepoExcludes $ownerNode.AbsolutePath $ownerNode.Name $fileRelToOwner)
             }
             $reposToStage.Add(@{ Node = $ownerNode; AddArgs = $addArgs })
         }
@@ -147,7 +172,10 @@ function Add-OgChange {
             $absPath = $node.AbsolutePath
             $name    = $node.Name
 
-            if (-not (Test-Path -LiteralPath $absPath)) {
+            # An uninitialised submodule is an empty directory: git run there would act on
+            # its owner, which this loop stages on its own.
+            if (-not (Test-Path -LiteralPath $absPath) -or
+                (-not $node.IsParent -and -not (Test-OgRepoInitialised -AbsolutePath $absPath))) {
                 Write-Warning "Repo path not on disk, skipping: $absPath"
                 continue
             }
@@ -201,15 +229,17 @@ function Add-OgChange {
         # intent-to-add index entry; already-tracked-but-modified files are a
         # no-op for -N since intent is implicit). Without -IntentToAdd it's the
         # canonical `git add -A` (full content staging).
-        $addArgs           = if ($IntentToAdd) { @('add', '-N', '-A') } else { @('add', '-A') }
-        $opDesc            = 'git ' + ($addArgs -join ' ')
+        $baseAddArgs       = if ($IntentToAdd) { @('add', '-N', '-A') } else { @('add', '-A') }
         $stagedActionLabel = if ($IntentToAdd) { 'intent-added' } else { 'staged' }
 
         foreach ($node in $tree) {
             $absPath = $node.AbsolutePath
             $name    = $node.Name
 
-            if (-not (Test-Path -LiteralPath $absPath)) {
+            # An uninitialised submodule is an empty directory: git run there would act on
+            # its owner, which this loop stages on its own.
+            if (-not (Test-Path -LiteralPath $absPath) -or
+                (-not $node.IsParent -and -not (Test-OgRepoInitialised -AbsolutePath $absPath))) {
                 Write-Warning "Repo path not on disk, skipping: $absPath"
                 continue
             }
@@ -230,6 +260,10 @@ function Add-OgChange {
                 }
                 continue
             }
+
+            $excludes = @(& $embeddedRepoExcludes $absPath $name $null)
+            $addArgs  = if ($excludes.Count -gt 0) { $baseAddArgs + @('--', '.') + $excludes } else { $baseAddArgs }
+            $opDesc   = 'git ' + ($addArgs -join ' ')
 
             $target = if ($node.Path) { "$name ($($node.Path))" } else { $name }
             if (-not $PSCmdlet.ShouldProcess($target, $opDesc)) {
