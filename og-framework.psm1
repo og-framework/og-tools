@@ -20,5 +20,7 @@ Set-Alias -Name oggitdiff     -Value Show-OgDiff
 Set-Alias -Name oglltest      -Value Invoke-OgLowLevelTest
 Set-Alias -Name oglicstamp    -Value Update-LicenseChangeDate
 Set-Alias -Name ogsteampublish -Value Publish-OgSteamBuild
+Set-Alias -Name ogbuild       -Value Invoke-OgUnrealBuild
+Set-Alias -Name ogplaytest    -Value Start-OgPlaytest
 
-Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitsubadd, oggitsubrm, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp, ogsteampublish
+Export-ModuleMember -Alias oggitstatus, oggitsync, oggitadd, oggitsubadd, oggitsubrm, oggitcommit, oggitpush, oggitmerge, oggitdiff, oglltest, oglicstamp, ogsteampublish, ogbuild, ogplaytest

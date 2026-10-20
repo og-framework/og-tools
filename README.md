@@ -91,6 +91,8 @@ Get-Command -Module og-framework | Select-Object Name, CommandType
 | `New-OgCloneScenario` | — | Scenario clone (simulation/brawler/unreal/cmake-runner); `-Branch` checks out a feature branch |
 | `Test-OgPinConsistency` | — | CI validation; sets exit code 0/1 |
 | `Publish-OgSteamBuild` | `ogsteampublish` | Package every depot, write SteamPipe VDFs, upload with steamcmd ([Steam publishing](#steam-publishing)) |
+| `Invoke-OgUnrealBuild` | `ogbuild` | UBT (Build.bat) build of one or more targets; default `<Project>Editor` Win64 Development, the binary `ogplaytest` runs ([local playtest](#local-playtest)) |
+| `Start-OgPlaytest` | `ogplaytest` | Local playtest: a dedicated server + N rendered clients (Editor binary, `-game`), or `-Join` clients to a running server ([local playtest](#local-playtest)) |
 | `Invoke-OgUnrealPackage` | — | UAT BuildCookRun wrapper for one Win64 Client/Server/Game target |
 | `Install-OgSteamCmd` | — | Download and bootstrap steamcmd into `%LOCALAPPDATA%\og-tools\steamcmd` |
 | `New-OgDedicatedServerLauncher` | — | Write a Windows PowerShell 5.1-compatible host launcher next to a packaged dedicated server ([host launcher](#dedicated-server-host-launcher)) |
@@ -229,6 +231,31 @@ The `New-OgCommit` pre-pass detects repos where a child was committed manually o
 og-tools (`PinStatus = parent-behind`) and stages the missing pin advance before
 the main commit loop runs — so ad-hoc `git commit` calls in submodules do not break
 the cascade.
+
+---
+
+## Local playtest
+
+Build the Editor target, then start a dedicated server and rendered clients as standalone `-game` processes (the shape of
+multi-process PIE, without the editor UI). Run both from the project root, or pass `-ProjectFile`.
+
+```powershell
+ogbuild                                   # <Project>Editor Win64 Development (refuses while UnrealEditor runs)
+ogbuild -Target Editor, OGSimulationTests # several targets, in order; stops at the first failure
+
+ogplaytest                                # server + 2 clients, PIE's packet emulation, logs in Saved\Playtest\<timestamp>
+ogplaytest -Clients 3 -Tag gate14         # three clients, logs in Saved\Playtest\gate14
+ogplaytest -Join                          # one more client joins the running server (logs into the newest session as the next clientN.log)
+ogplaytest -Join -Clients 2 -Address 192.168.1.20 -Port 7777
+ogplaytest -NoEmulation -Trace -LogLevels @{ LogOGNet = 'Verbose'; LogOGSim = 'Log' }
+```
+
+- The server loads the project's `GameDefaultMap` (`Config\DefaultEngine.ini`) unless `-Map` is given, and listens on `-Port` (default 17900).
+- `-NoEmulation` turns off the packet lag/loss profile (outgoing 15–50 ms / 1 %, incoming 15–50 ms / 2 %); `-Trace` records an Unreal
+  Insights trace of the server; `-LogLevels` sets `[Core.Log]` verbosities on every process; `-ExtraArgs`, `-ServerArgs` and
+  `-ClientArgs` pass anything else.
+- A new session refuses to start while an `UnrealEditor` process runs (`-Force` overrides); `-Join` does not, since the server is one.
+- To leave mid-match, close a client window; to rejoin, `ogplaytest -Join`. Close the clients before the server.
 
 ---
 
