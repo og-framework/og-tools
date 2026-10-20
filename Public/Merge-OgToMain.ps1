@@ -38,6 +38,11 @@ function Merge-OgToMain {
         'git submodule update' checks out feature-branch commits instead of each child's main
         tip.
 
+        NEW SUBMODULES: after a cascade that completes (no conflict or failure), every
+        submodule that is now declared on MainBranch but not initialised on disk (typically
+        one the feature branch added) is initialised with 'git submodule update --init' in
+        its owner and reported with Action='initialised'.
+
         DOES NOT PUSH. Like Push-OgFramework, this cmdlet is human-run and leaves each repo
         on MainBranch with the merge commit unpushed. Run 'oggitpush' (Push-OgFramework)
         afterward to push every main, children before the superproject.
@@ -99,6 +104,8 @@ function Merge-OgToMain {
           'failed'                 — a git step failed (e.g. checkout main); cascade halted
           'skipped-after-conflict' — a deeper repo halted the cascade before this repo
           'would-merge'            — WhatIf preview
+          'initialised'            — a submodule new on MainBranch, initialised after the cascade
+          'would-init'             — WhatIf preview of the same
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -137,7 +144,9 @@ function Merge-OgToMain {
     $dirty = [System.Collections.Generic.List[string]]::new()
     foreach ($repo in $ordered) {
         $absPath = $repo.AbsolutePath
-        if (-not (Test-Path -LiteralPath $absPath)) {
+        # A missing or uninitialised (empty-directory) submodule: git there would act on its owner.
+        if (-not (Test-Path -LiteralPath $absPath) -or
+            (-not $repo.IsParent -and -not (Test-OgRepoInitialised -AbsolutePath $absPath))) {
             Write-Warning "Repo path not on disk, skipping: $absPath"
             continue
         }
@@ -269,6 +278,13 @@ function Merge-OgToMain {
     }
 
     if (-not $halted) {
+        # Submodules that are new on MainBranch (declared, not initialised): bring them onto disk.
+        foreach ($init in (Initialize-OgMissingSubmodule -ProjectRoot $ProjectRoot)) {
+            [PSCustomObject]@{ PSTypeName = 'Og.MergeResult'
+                Repo = $init.Repo; Path = $init.Path; Branch = $MainBranch
+                Action = $init.Action; FromSha = $null; ToSha = $init.Sha; Conflicts = @(); Error = $init.Error }
+        }
+
         Write-Verbose ("Merge cascade complete. Each parent's submodule pin on '$MainBranch' references the merged " +
             "feature commit (reachable from the child's '$MainBranch' via the --no-ff merge, so pins RESOLVE and push/clone " +
             "work). The pin is NOT at the child's '$MainBranch' tip yet, so Test-OgPinConsistency will warn. To advance pins " +

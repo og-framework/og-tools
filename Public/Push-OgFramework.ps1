@@ -19,6 +19,11 @@ function Push-OgFramework {
         On the first push failure the cmdlet stops the cascade so parents that reference
         unpushed children are never pushed.
 
+        NEW BRANCHES: when origin/<branch> does not exist yet (the first push of a feature
+        branch, or a submodule just added with Add-OgSubmodule), the cmdlet runs
+        'git push -u origin <branch>' so the branch gets its upstream; otherwise
+        'git push origin <branch>'.
+
     .PARAMETER ProjectRoot
         Path to the project root. Defaults to the current working directory.
 
@@ -57,7 +62,9 @@ function Push-OgFramework {
 
     foreach ($repo in $ordered) {
         $absPath = $repo.AbsolutePath
-        if (-not (Test-Path -LiteralPath $absPath)) { continue }
+        # Skip a missing or uninitialised (empty-directory) submodule: git there would act on its owner.
+        if (-not (Test-Path -LiteralPath $absPath) -or
+            (-not $repo.IsParent -and -not (Test-OgRepoInitialised -AbsolutePath $absPath))) { continue }
 
         # Branch detection (detached HEAD => 'HEAD')
         $branchResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'rev-parse', '--abbrev-ref', 'HEAD'
@@ -100,10 +107,11 @@ function Push-OgFramework {
         $headSha       = if ($headShaResult.ExitCode -eq 0) { $headShaResult.StdOut } else { '(unknown)' }
 
         $remoteRef       = "origin/$branch"
-        $remoteShaResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'rev-parse', '--short', $remoteRef
+        $remoteShaResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'rev-parse', '--short', '--verify', '--quiet', "refs/remotes/$remoteRef"
         $fromSha         = $null
         $ahead           = 0
-        if ($remoteShaResult.ExitCode -eq 0) {
+        $isNewBranch     = $remoteShaResult.ExitCode -ne 0
+        if (-not $isNewBranch) {
             $fromSha = $remoteShaResult.StdOut
             $countResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'rev-list', '--count', "$remoteRef..HEAD"
             if ($countResult.ExitCode -eq 0 -and $countResult.StdOut -match '^\d+$') {
@@ -128,8 +136,13 @@ function Push-OgFramework {
             continue
         }
 
-        $whatIfTarget = "$($repo.Name) ($branch, $ahead commit$(if ($ahead -ne 1) { 's' }))"
-        if (-not $PSCmdlet.ShouldProcess($whatIfTarget, "git push origin $branch")) {
+        $pushArgs     = if ($isNewBranch) { @('push', '-u', 'origin', $branch) } else { @('push', 'origin', $branch) }
+        $whatIfTarget = if ($isNewBranch) {
+            "$($repo.Name) ($branch, new on origin)"
+        } else {
+            "$($repo.Name) ($branch, $ahead commit$(if ($ahead -ne 1) { 's' }))"
+        }
+        if (-not $PSCmdlet.ShouldProcess($whatIfTarget, 'git ' + ($pushArgs -join ' '))) {
             [PSCustomObject]@{ PSTypeName = 'Og.PushResult';
                 Repo          = $repo.Name
                 Path          = $repo.Path
@@ -143,7 +156,7 @@ function Push-OgFramework {
             continue
         }
 
-        $pushResult = Invoke-Git -WorkingDirectory $absPath -Arguments 'push', 'origin', $branch
+        $pushResult = Invoke-Git -WorkingDirectory $absPath -Arguments $pushArgs
         if ($pushResult.ExitCode -eq 0) {
             [PSCustomObject]@{ PSTypeName = 'Og.PushResult';
                 Repo          = $repo.Name
