@@ -78,6 +78,7 @@ Get-Command -Module og-framework | Select-Object Name, CommandType
 | Cmdlet | Alias | Purpose |
 |--------|-------|---------|
 | `Get-OgRepoStatus` | `oggitstatus` | Read tree state (PSObjects per repo) |
+| `Show-OgDiff` | `oggitdiff` | Open what changed across the tree in the diff tool: one directory-diff tab per changed repo in one window; `-Staged`, `-Against`, `-Commit`, `-Pick`, `-PerFile` ([reviewing changes](#reviewing-changes-with-oggitdiff)) |
 | `Sync-OgFramework` | `oggitsync` | Fetch + ff-merge cascade deepest-first; initialises new submodules; `-Branch` syncs a feature branch instead of main |
 | `Add-OgChange` | `oggitadd` | Stage changes across the tree; skips (with a warning) nested repos not declared in `.gitmodules` |
 | `New-OgCommit` | `oggitcommit` | Commit + auto pin-advance cascade |
@@ -179,6 +180,234 @@ oggitpush
 
 Then archive the GitHub repo (read-only). Do not delete it: pins in the branch history
 must keep resolving.
+
+---
+
+## Reviewing changes with `oggitdiff`
+
+`Show-OgDiff` (`oggitdiff`) opens what changed across the whole og tree (the project root and its
+submodules, recursively) in the git-configured diff tool. By default each repo with a change opens as a
+**directory diff of its changed files only**, and all of them land as **tabs of one Diffinity window**,
+one tab per changed repo. Run it from the project root, or pass `-ProjectRoot <path>`.
+
+```powershell
+oggitdiff                               # working tree vs HEAD in every repo (untracked files included)
+oggitdiff -Staged                       # the index vs HEAD: what you are about to commit
+oggitdiff -Against origin/main          # HEAD vs its merge base with origin/main (<ref>...HEAD)
+oggitdiff -Against origin/main -Fetch   # the same, after git fetch --recurse-submodules
+oggitdiff -Commit 6245add               # what one oggitcommit run (root commit 6245add) changed, every repo
+oggitdiff -Pick                         # pick that root commit from a list of the last 30
+oggitdiff -Pick -Count 50
+oggitdiff -PerFile                      # git difftool's per-file windows instead (with any mode above)
+oggitdiff -Tool meld                    # another git-configured tool for this call
+```
+
+### Modes
+
+| Mode | Base side | Head side |
+|---|---|---|
+| (default) | HEAD | the working tree, including untracked files that are not ignored (a repo with only a new file opens) |
+| `-Staged` | HEAD | the index |
+| `-Against <ref>` | `git merge-base <ref> HEAD`, never `<ref>`'s tip | HEAD |
+| `-Commit <rev>` | each touched repo's old pin | its new pin |
+| `-Pick [-Count <n>]` | as `-Commit`, for the picked commit | |
+
+- **`-Against`** is the three-dot range on purpose: only what your branch added since the branch point, not
+  what `<ref>` gained since. A repo where `<ref>` does not resolve is `no-ref` and skipped; one without a
+  merge base is `failed`; the sweep goes on. `-Fetch` (only with `-Against`) runs
+  `git fetch --recurse-submodules` from the project root first, which updates the remote-tracking refs
+  (see [Read-only](#what-a-diff-contains) for the other exception, `-PerFile`).
+- **`-Commit <rev>`**: `<rev>` names a commit in the project root (a sha, short sha, `HEAD`, ...). The root's
+  own change is `<rev>^1..<rev>` (the first parent, so a merge commit works), shown only if it changed root
+  files. Each submodule whose pin the commit moved is diffed from its old pin to its new pin, exactly those
+  two gitlink ids (never its current HEAD), and nested submodules through the pin changes inside that range.
+  Only the repos the commit touched get a result. The run is labelled `commit-<short sha>`.
+- **`-PerFile`** keeps `git difftool --no-prompt` per repo (`--cached` for `-Staged`, `<ref>...HEAD` for
+  `-Against`, `<old> <new>` per repo for `-Commit`/`-Pick`, `--tool=<Tool>` with `-Tool`): one window per
+  changed file, temp files managed by git. See [-PerFile](#-perfile).
+- **`-DirDiff`** is accepted and ignored: directory diffs are the default, and `git difftool --dir-diff` is
+  never used (below).
+- `-Staged`, `-Against`, `-Commit` and `-Pick` are mutually exclusive.
+
+### Results
+
+One `Og.DiffResult` per repo, in tree order: `Repo`, `Path`, `Action`, `Error`, `Ref`, `Range`, `BasePath`,
+`HeadPath`, `Commit`, `BaseRev`, `HeadRev`, `FileCount`, `RunPath`. The default table shows `Repo`,
+`Action`, `Files` (= `FileCount`, the number of changed files) and `Error`. With `-Commit`/`-Pick` only the
+touched repos are listed; a cancelled `-Pick` returns nothing. `Get-Help Show-OgDiff -Full` has every field.
+
+| Action | Meaning |
+|---|---|
+| `opened` | its changed files were exported and the directory diff launched (`-PerFile`: git difftool ran) |
+| `clean` | nothing to show (`Files` 0), no tab |
+| `failed` | the listing, export or launch failed, or no diff tool is configured; `Error` says why. `BasePath`/`HeadPath`/`RunPath` are set when the export worked, so you can open the folders by hand |
+| `no-ref` | `-Against`: `<ref>` does not resolve in that repo |
+| `missing-commit` | `-Commit`/`-Pick`: a pin commit is not present locally (never fetched), or the submodule's objects are nowhere here (never initialised, or removed together with its git dir, as `oggitsubrm` does). A warning, never fatal: the other repos still open |
+
+### What a diff contains
+
+- **Changed files only.** A modified file is on both sides, an added file on the head side only, a deleted
+  file on the base side only; a rename is a delete plus an add, so both names appear.
+- **Same line endings on both sides.** Every side read from git goes through git's own checkout conversion
+  (`core.autocrlf`, `.gitattributes`), as the working tree did, so an unchanged CRLF file never shows as a
+  difference. The working-tree side is copied byte for byte.
+- **Submodules are tabs, never folders.** A submodule is never a folder or placeholder in its parent's diff:
+  it is a repo of its own, with its own tab. Under `-Commit`, a submodule whose only change is moved pins of
+  its own submodules has no changed file: it is `clean`, with no tab (its nested repos have their own
+  results). Under `-PerFile` it is `opened`, because git difftool shows the moved pin itself.
+- **Removed or deinit-ed submodules** (`-Commit`): a submodule the commit removed, or one without a work tree
+  here, is still diffed, from the git dir its parent kept (`.git/modules/<name>`); a removed one's head side
+  is empty, an added one's base side. Only when that git dir is gone too (after `oggitsubrm`) is it
+  `missing-commit`.
+- **Read-only, with two exceptions.** The directory diffs (every mode without `-PerFile`) never write to a
+  repo: no index, ref or config change. Their listing and export run on a temporary copy of the index,
+  because a plain `git diff` rewrites `.git/index` when files are only stat-dirty (measured, even with
+  `GIT_OPTIONAL_LOCKS=0`). The exceptions: `-Fetch` updates the remote-tracking refs, and `-PerFile`'s
+  `git difftool`, git's own interactive command, may refresh the index's stat information, as any
+  `git diff` does.
+
+### Run folders and retention
+
+Every call that opens anything creates a new run folder:
+
+```text
+%TEMP%\og-diff\<yyyyMMdd-HHmmss>-<label>\<repo>\<side>
+```
+
+- `<label>`: `worktree`, `staged`, `against-<ref>` or `commit-<short sha>`, made filesystem-safe
+  (`origin/main` becomes `origin-main`) and cut to 24 characters. A second run in the same second gets
+  `-2`, `-3`, ...
+- `<repo>`: the repo's folder name, or its og-tree path made safe when two touched repos share a name.
+- `<side>`: `<repo> base <sha7>`, `<repo> head <sha7>`, `<repo> working`, `<repo> index`, or
+  `<repo> base empty` / `<repo> head empty` for an empty side, where `<repo>` is the repo folder name above.
+  Diffinity titles a folder-diff tab from the two folder names only, so the repo is in each side's name and a
+  tab reads e.g. `og-brawler base e289ac3 - og-brawler head db4ec6a`. The names contain spaces, which is fine
+  as long as the difftool command quotes `"$LOCAL"` and `"$REMOTE"` (as the setup below does).
+- `%TEMP%` is .NET's `GetTempPath()` (`%TMP%`, else `%TEMP%`).
+
+Runs never overwrite each other, so the tabs of an earlier run that are still open keep their files.
+**Retention:** the 10 newest runs are kept (by the timestamp in the name) and older ones are deleted after
+each launch; the run just opened always survives. Only folders that are provably runs are ever deleted: the
+name pattern above, holding only repo folders that hold nothing but side folders and their marker files,
+with every side folder marked (below), and no junction or link anywhere in that shape. Everything else under
+`og-diff` is left alone (a run with an unmarked side or a file you dropped into it is kept whole). In particular the
+**legacy `og-diff\<repo>\{base,head}` folders** that `-Against -DirDiff` wrote before 1.6.0 are never
+pruned (no timestamp, no marker): delete them once by hand.
+
+```powershell
+# List the legacy folders (no timestamp prefix); check them, then delete them yourself.
+Get-ChildItem "$([System.IO.Path]::GetTempPath())og-diff" -Directory | Where-Object Name -notmatch '^\d{8}-\d{6}-'
+```
+
+**The `.og-diff-side` marker.** Every side folder has a small hidden marker file **beside** it in the repo
+folder, named after it: `<side>.og-diff-side`, e.g.
+`og-brawler\og-brawler base e289ac3.og-diff-side`. It exists because the export clears a side folder before
+writing into it: a destination is cleared only if it is empty or carries its marker, so a wrong path can
+never delete your files, and the retention prune requires it too. It sits beside the folder, not inside,
+so the side folders hold nothing but the exported files and the diff never lists it.
+
+**Older run folders** (made before this layout, with sides named `base-<sha7>`, `head-<sha7>`, `working`,
+`index`, `empty`) carry the marker as a hidden `.og-diff-side` file *inside* each side folder. That form is
+still accepted by the export and by the retention prune, so those runs still age out under retention like
+any other.
+
+### Diffinity setup and the single window
+
+```powershell
+git config --global diff.tool diffinity
+git config --global difftool.diffinity.cmd '"C:/Program Files/Diffinity/Diffinity.exe" "$LOCAL" "$REMOTE"'
+```
+
+Turn on tabs in Diffinity. Each changed repo's launch is then a tab of the running window.
+
+- **The configured command is the only command line.** `$LOCAL` and `$REMOTE` become the two side folders;
+  `oggitdiff` never adds a tool flag, and in particular never `-forceNewInstance` (which would open a
+  window per repo).
+- The tool is resolved **once per call**, in the first changed repo: `-Tool`, else `diff.tool`, then
+  `difftool.<tool>.cmd`. A repo-local difftool config in a later repo is not honoured in directory mode.
+  With no tool configured, every changed repo is `failed` with a clear error, nothing is exported, and there
+  is no fallback to `git difftool --dir-diff`.
+- **Launch order.** The launches are sequential. If the tool is not running yet, `oggitdiff` waits after the
+  first launch **up to 10 s** until the tool's process is up (so the first tab can take a moment), then
+  launches the rest with a 300 ms pause before each, so they cannot race into separate windows. If the
+  process does not appear in time, it warns and launches the rest anyway. When the tool is already running
+  there is no wait, only the pauses.
+- **A `cmd /c`-wrapped command defeats the wait.** The process looked for is the command line's first token.
+  A command such as `cmd /c "...Diffinity.exe" "$LOCAL" "$REMOTE"` names `cmd`, which is always running, so
+  the wait is skipped and the tabs may open in separate windows. Point the command at the tool's exe.
+
+**Why never `git difftool --dir-diff`.** It copies the sides into a temp directory, launches the tool, and
+deletes that directory the moment the tool's *process* exits. A single-instance tool (Diffinity included)
+hands a new invocation to the running window and exits at once, so git deletes the files while the window
+still shows them and the panes go empty. Hence the persistent run folders above.
+
+### `-PerFile`
+
+- The "is there a change?" check before git difftool is git's own `git diff --name-only` with the same
+  arguments, run on a temporary copy of the index. Like git difftool, it compares the working tree with the
+  **index** (not HEAD) and ignores untracked files: a repo whose only change is staged, or untracked, is
+  `clean` and opens nothing (use the default mode, or `-Staged`). git difftool itself is git's interactive
+  command and may refresh the index's stat information, as any `git diff` does.
+- Under `-Commit`/`-Pick` some repos have no per-file form and report `failed` with a hint to the directory
+  mode (`oggitdiff -Commit <sha>`): a submodule the commit added or removed (an empty side), a root commit
+  without a parent, and a repo without a work tree here (present only in its parent's `modules/`).
+
+### The commit picker (`-Pick`)
+
+`oggitdiff -Pick` lists the project root's last `-Count` commits (default 30) on the first-parent line of
+HEAD, newest first, one line each, then opens the picked one exactly as `oggitdiff -Commit <its sha>`:
+
+```text
+> 6245add  2026-10-21 23:29  root +5       Split the game-agnostic half of ...
+```
+
+The columns are the short sha, the author date (local time), the repos the commit touched, and the subject.
+
+| Key | Action |
+|---|---|
+| Up / Down, PgUp / PgDn, Home / End | move the selection |
+| Enter | open the selected commit |
+| Esc or q | cancel: nothing is opened and nothing is returned |
+
+The touched column:
+
+| Text | Meaning |
+|---|---|
+| `root +5` | the root's own files and 5 more repos |
+| `og-brawler +1` | no root files: the first touched submodule and 1 more |
+| `root +2 (1 missing)` | 1 of the touched repos is `missing-commit` |
+| `(no changes)` | an empty commit |
+| `…` | not resolved yet |
+| `!` | the commit cannot be resolved; the reason is on the detail line |
+
+- Only the commits on screen are resolved, the selected one first and each at most once, so the list appears
+  at once and fills in while you look (about 0.1–0.7 s per commit on og-brawler-unreal).
+- The **detail line** under the list names every repo the selected commit touched, the root by its folder
+  name, with its range (`0000000` for an empty side), e.g.
+  `repos: og-brawler-unreal 758fb77..6245add, og-brawler e289ac3..db4ec6a, ...`, plus `(added)` or
+  `(removed)`; a `missing-commit` repo shows as `<name> (missing-commit)`.
+- A `!` row can still be picked: Enter then fails with the same error as `-Commit <its sha>` would.
+- The picker draws on the console's **alternate screen** and restores the screen, cursor and colours in a
+  `finally`, also after an error or Ctrl+C (which may only take effect at the next key press). The picked
+  commit's results are written after that, on your normal screen.
+- It needs an **interactive console**. With redirected input or output (a script, a pipe, CI) or a host
+  without virtual-terminal support it fails before running any git command:
+  `The commit picker needs an interactive console, but its input is redirected. Name the commit instead: oggitdiff -Commit <sha>`.
+- `…` needs a console whose output encoding is UTF-8 (code page 65001); on an OEM code page such as 437 it
+  shows as `?`. A subject with wide characters (CJK, emoji) may wrap, as the width counts UTF-16 units.
+- `-PerFile` and `-Tool` apply to the picked commit. `-Count` without `-Pick` makes PowerShell prompt for
+  `-Pick`.
+
+### Limits
+
+- **Case-only paths.** Two changed paths that differ only in case (`A.txt` and `a.txt`) are one file on
+  NTFS: in the export one overwrites the other.
+- **`core.splitIndex=true`.** Refreshing the temporary index copy can write a new `sharedindex.*` file into
+  `.git` (never the index itself). Split index is not git's default.
+- **Long paths.** The run label is cut to 24 characters so ordinary runs stay well under 260 characters, and
+  the export's git calls run with `-c core.longpaths=true` (on the command line, never written to a config),
+  so a deep repo path under a run folder still exports. Whether the diff tool can open a path beyond 260
+  characters is up to the tool.
 
 ---
 

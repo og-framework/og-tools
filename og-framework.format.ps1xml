@@ -152,7 +152,8 @@
       <TableControl>
         <TableHeaders>
           <TableColumnHeader><Label>Repo</Label><Width>22</Width></TableColumnHeader>
-          <TableColumnHeader><Label>Action</Label><Width>10</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Action</Label><Width>14</Width></TableColumnHeader>
+          <TableColumnHeader><Label>Files</Label><Width>6</Width><Alignment>Right</Alignment></TableColumnHeader>
           <TableColumnHeader><Label>Error</Label></TableColumnHeader>
         </TableHeaders>
         <TableRowEntries>
@@ -160,6 +161,7 @@
             <TableColumnItems>
               <TableColumnItem><PropertyName>Repo</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>Action</PropertyName></TableColumnItem>
+              <TableColumnItem><PropertyName>FileCount</PropertyName></TableColumnItem>
               <TableColumnItem><PropertyName>Error</PropertyName></TableColumnItem>
             </TableColumnItems>
           </TableRowEntry>
