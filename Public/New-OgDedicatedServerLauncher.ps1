@@ -28,8 +28,9 @@ function New-OgDedicatedServerLauncher {
         Both modes box the main join address, copy it to the clipboard and write join_info.txt.
         The server runs with <ServerArguments> -port=<Port> -log -abslog="HostLogs\server-<time>.log";
         the script tails that log, prints a friendly line for each JoinLinePattern match and,
-        once ReadyLinePattern matches (or at once when it is empty), asks
-        "Start the game on this PC now? [Y/n]" and runs ClientLaunch.
+        once ReadyLinePattern matches (or at once when it is empty), picks the first usable
+        ClientLaunch entry, asks "Start the game on this PC now? [Y/n]" and starts it. When no
+        entry is usable it says why and asks the host to start the game themselves.
 
         All files are written with CRLF; the .ps1 and .psd1 as UTF-8 with BOM (so Windows
         PowerShell 5.1 reads non-ASCII text correctly), the .bat files as ASCII. Existing files are
@@ -63,10 +64,13 @@ function New-OgDedicatedServerLauncher {
         Name shown in the console and used for the firewall rule and the UPnP mapping. No double quote.
 
     .PARAMETER ClientLaunch
-        What "Start the game on this PC now?" runs: a URI (e.g. steam://rungameid/{AppId:game}) or
-        a path relative to -Destination (e.g. ..\Client\MyGameClient.exe). A token
-        {AppId:<name>} is replaced from -AppIds; an AppId of 0 (placeholder) turns the launch step
-        into a message. '' only prints the hint.
+        What "Start the game on this PC now?" runs: one entry or a list of fallbacks, each a URI
+        (e.g. steam://rungameid/{AppId:game}) or a path relative to -Destination
+        (e.g. ..\MyGameClient.exe). A token {AppId:<name>} is replaced from -AppIds; a token whose
+        AppId is 0 (placeholder) stays in the settings file and makes that entry unusable. At run
+        time the first usable entry wins: a path that exists, or a URI without a placeholder
+        token. No usable entry turns the launch step into a message with the reasons. No entry,
+        or a single '', only prints the hint.
 
     .PARAMETER AppIds
         Hashtable of app name to Steam AppId, used for {AppId:<name>} tokens in -ClientLaunch.
@@ -76,13 +80,19 @@ function New-OgDedicatedServerLauncher {
 
     .OUTPUTS
         [pscustomobject] with Destination, LocalLauncher, OnlineLauncher, Script, Settings,
-        ClientLaunch (tokens resolved) and ClientLaunchSkipReason.
+        ClientLaunch (the entries as written to the settings file: tokens with a real AppId filled
+        in, placeholder tokens kept) and ClientLaunchSkipReason. ClientLaunchSkipReason is '' unless
+        every entry holds a placeholder token, so the game can never be started; it then lists the
+        placeholder apps.
 
     .EXAMPLE
         New-OgDedicatedServerLauncher -Destination .\Build\WindowsServer -ServerExecutable MyGameServer.exe `
             -ServerArguments '/Game/Maps/Arena' -Port 7777 -Title 'MyGame server' `
             -JoinLinePattern 'Session: (?:(?<joined>joined)|(?<left>left)) players=(?<players>\d+) tested=(?<tested>\d+)' `
-            -ClientLaunch 'steam://rungameid/{AppId:game}' -AppIds @{ game = 480 }
+            -ClientLaunch '..\MyGameClient.exe', 'steam://rungameid/{AppId:game}' -AppIds @{ game = 480 }
+
+        Inside the game install (server in a subfolder) the client exe one folder up is started;
+        installed on its own, the game is started through Steam.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -109,8 +119,9 @@ function New-OgDedicatedServerLauncher {
         [Parameter(Mandatory)]
         [string] $Title,
 
+        [AllowEmptyCollection()]
         [AllowEmptyString()]
-        [string] $ClientLaunch = '',
+        [string[]] $ClientLaunch = @(),
 
         [hashtable] $AppIds = @{},
 
@@ -138,31 +149,39 @@ function New-OgDedicatedServerLauncher {
         throw "New-OgDedicatedServerLauncher: $($_.Exception.Message)"
     }
 
-    $skipReason = ''
-    $resolvedLaunch = $ClientLaunch
-    foreach ($token in [regex]::Matches($ClientLaunch, '\{AppId:(?<name>[^}]*)\}')) {
-        $appName = $token.Groups['name'].Value
-        $appId = [long]$AppIds[$appName]
-        if ($appId -eq 0) {
-            $skipReason = "the Steam app '$appName' has no AppId yet (placeholder 0)"
-            $resolvedLaunch = ''
-            break
+    $resolvedLaunch = [System.Collections.Generic.List[string]]::new()
+    $placeholderReasons = [System.Collections.Generic.List[string]]::new()
+    $usableEntries = 0
+    foreach ($entry in @($ClientLaunch | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+        $resolved = $entry
+        $blocked = $false
+        foreach ($token in [regex]::Matches($entry, '\{AppId:(?<name>[^}]*)\}')) {
+            $appName = $token.Groups['name'].Value
+            $appId = [long]$AppIds[$appName]
+            if ($appId -eq 0) {
+                $blocked = $true
+                $reason = "the Steam app '$appName' has no AppId yet (placeholder 0)"
+                if (-not $placeholderReasons.Contains($reason)) { $placeholderReasons.Add($reason) }
+                continue
+            }
+            $resolved = $resolved.Replace($token.Value, [string]$appId)
         }
-        $resolvedLaunch = $resolvedLaunch.Replace($token.Value, [string]$appId)
+        if (-not $blocked) { $usableEntries++ }
+        $resolvedLaunch.Add($resolved)
     }
+    $skipReason = if ($resolvedLaunch.Count -gt 0 -and $usableEntries -eq 0) { $placeholderReasons -join '; ' } else { '' }
 
     $quote = { param([string] $Text) "'" + $Text.Replace("'", "''") + "'" }
     $settingsText = @(
         '@{'
-        '    SchemaVersion          = 1'
+        '    SchemaVersion          = 2'
         "    Title                  = $(& $quote $Title)"
         "    ServerExecutable       = $(& $quote $ServerExecutable)"
         "    ServerArguments        = $(& $quote $ServerArguments)"
         "    Port                   = $Port"
         "    JoinLinePattern        = $(& $quote $JoinLinePattern)"
         "    ReadyLinePattern       = $(& $quote $ReadyLinePattern)"
-        "    ClientLaunch           = $(& $quote $resolvedLaunch)"
-        "    ClientLaunchSkipReason = $(& $quote $skipReason)"
+        "    ClientLaunch           = @($(@($resolvedLaunch | ForEach-Object { & $quote $_ }) -join ', '))"
         "    LocalHint              = $(& $quote $LocalHint)"
         "    PublicIpServices       = @('https://api.ipify.org', 'https://checkip.amazonaws.com', 'https://icanhazip.com')"
         '}'
@@ -199,7 +218,7 @@ function New-OgDedicatedServerLauncher {
         OnlineLauncher         = Join-Path $destinationPath 'Host Online Playtest.bat'
         Script                 = Join-Path $destinationPath 'host_server.ps1'
         Settings               = Join-Path $destinationPath 'host_server.settings.psd1'
-        ClientLaunch           = $resolvedLaunch
+        ClientLaunch           = [string[]]$resolvedLaunch.ToArray()
         ClientLaunchSkipReason = $skipReason
     }
 }

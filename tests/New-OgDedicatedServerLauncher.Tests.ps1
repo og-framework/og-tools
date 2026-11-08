@@ -74,18 +74,21 @@ Describe 'New-OgDedicatedServerLauncher' {
         It 'writes every value into host_server.settings.psd1, with the AppId token resolved' {
             [System.IO.File]::ReadAllBytes($result.Settings)[0..2] | Should -Be @(0xEF, 0xBB, 0xBF)
             $settings = Import-PowerShellDataFile -LiteralPath $result.Settings
-            $settings.SchemaVersion | Should -Be 1
+            $settings.SchemaVersion | Should -Be 2
             $settings.Title | Should -BeExactly 'Test Game server'
             $settings.ServerExecutable | Should -BeExactly 'GameServer.exe'
             $settings.ServerArguments | Should -BeExactly '/Game/Maps/Arena'
             $settings.Port | Should -Be 7777
             $settings.JoinLinePattern | Should -BeExactly $joinPattern
             $settings.ReadyLinePattern | Should -BeExactly $readyPattern
-            $settings.ClientLaunch | Should -BeExactly 'steam://rungameid/480'
-            $settings.ClientLaunchSkipReason | Should -BeExactly ''
+            , $settings.ClientLaunch | Should -BeOfType [object[]]
+            $settings.ClientLaunch | Should -BeExactly @('steam://rungameid/480')
+            $settings.Keys | Should -Not -Contain 'ClientLaunchSkipReason'
             $settings.LocalHint | Should -BeExactly 'Press Tab to add a local player.'
             @($settings.PublicIpServices).Count | Should -BeGreaterThan 1
-            $result.ClientLaunch | Should -BeExactly 'steam://rungameid/480'
+            , $result.ClientLaunch | Should -BeOfType [string[]]
+            $result.ClientLaunch | Should -BeExactly @('steam://rungameid/480')
+            $result.ClientLaunchSkipReason | Should -BeExactly ''
         }
 
         It 'round-trips quotes and non-ASCII text through the settings file' {
@@ -97,16 +100,62 @@ Describe 'New-OgDedicatedServerLauncher' {
     }
 
     Context 'ClientLaunch tokens' {
-        It 'turns a placeholder AppId 0 into an empty launch and a skip reason' {
+        It 'keeps a placeholder AppId 0 token in the entry and gives a skip reason' {
             $r = New-TestLauncher -Name 'placeholder' -Override @{ AppIds = @{ game = 0 } }
-            $r.ClientLaunch | Should -BeExactly ''
+            $r.ClientLaunch | Should -BeExactly @('steam://rungameid/{AppId:game}')
             $r.ClientLaunchSkipReason | Should -BeExactly "the Steam app 'game' has no AppId yet (placeholder 0)"
-            (Import-PowerShellDataFile -LiteralPath $r.Settings).ClientLaunchSkipReason | Should -BeExactly $r.ClientLaunchSkipReason
+            (Import-PowerShellDataFile -LiteralPath $r.Settings).ClientLaunch | Should -BeExactly @('steam://rungameid/{AppId:game}')
         }
 
         It 'passes a launch without tokens through unchanged' {
             $r = New-TestLauncher -Name 'plainpath' -Override @{ ClientLaunch = '..\Client\GameClient.exe' }
-            $r.ClientLaunch | Should -BeExactly '..\Client\GameClient.exe'
+            $r.ClientLaunch | Should -BeExactly @('..\Client\GameClient.exe')
+        }
+
+        It 'resolves the tokens of every entry of a list, in order' {
+            $r = New-TestLauncher -Name 'list' -Override @{
+                ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}', 'steam://run/{AppId:server}/{AppId:game}')
+            }
+            $expected = @('..\GameClient.exe', 'steam://rungameid/480', 'steam://run/481/480')
+            $r.ClientLaunch | Should -BeExactly $expected
+            $r.ClientLaunchSkipReason | Should -BeExactly ''
+            (Import-PowerShellDataFile -LiteralPath $r.Settings).ClientLaunch | Should -BeExactly $expected
+        }
+
+        It 'gives no skip reason while one entry may still work, and keeps placeholder tokens in place' {
+            $r = New-TestLauncher -Name 'listmixed' -Override @{ ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}'); AppIds = @{ game = 0 } }
+            $r.ClientLaunch | Should -BeExactly @('..\GameClient.exe', 'steam://rungameid/{AppId:game}')
+            $r.ClientLaunchSkipReason | Should -BeExactly ''
+        }
+
+        It 'lists every placeholder app when no entry can work' {
+            $r = New-TestLauncher -Name 'listblocked' -Override @{
+                ClientLaunch = @('steam://rungameid/{AppId:game}', 'steam://run/{AppId:server}', 'steam://x/{AppId:game}')
+                AppIds       = @{ game = 0; server = 0 }
+            }
+            $r.ClientLaunchSkipReason | Should -BeExactly "the Steam app 'game' has no AppId yet (placeholder 0); the Steam app 'server' has no AppId yet (placeholder 0)"
+        }
+
+        It 'writes an empty ClientLaunch list for <Case>' -TestCases @(
+            @{ Case = 'no entry'; Value = @() }
+            @{ Case = "a single ''"; Value = '' }
+        ) {
+            $v = $Value
+            $r = New-TestLauncher -Name ('empty-' + [guid]::NewGuid().ToString('N')) -Override @{ ClientLaunch = $v }
+            $r.ClientLaunch.Count | Should -Be 0
+            $r.ClientLaunchSkipReason | Should -BeExactly ''
+            Get-Content -Raw -LiteralPath $r.Settings | Should -Match 'ClientLaunch\s+= @\(\)'
+            @((Import-PowerShellDataFile -LiteralPath $r.Settings).ClientLaunch).Count | Should -Be 0
+        }
+
+        It 'rejects <Case> in a ClientLaunch list' -TestCases @(
+            @{ Case = 'an empty entry'; Value = @('..\GameClient.exe', ''); Message = "*'ClientLaunch``[1``]' must not be empty*" }
+            @{ Case = 'an entry naming an unknown app'; Value = @('..\GameClient.exe', 'steam://rungameid/{AppId:nope}'); Message = "*'ClientLaunch``[1``]' references unknown app 'nope'*" }
+            @{ Case = 'an absolute entry'; Value = @('C:\Games\GameClient.exe', 'steam://rungameid/{AppId:game}'); Message = "*'ClientLaunch``[0``]' must be a URI or a path relative*" }
+            @{ Case = 'an entry with a line break'; Value = @('..\a.exe', "steam://x`n"); Message = "*'ClientLaunch``[1``]' must be a single line*" }
+        ) {
+            $v = $Value
+            { New-TestLauncher -Name ('badlist-' + [guid]::NewGuid().ToString('N')) -Override @{ ClientLaunch = $v } } | Should -Throw $Message
         }
 
         It 'rejects a token naming an unknown app' {
@@ -565,6 +614,49 @@ Describe 'host_server.ps1 (generated)' {
             Get-TestHostText | Should -Match 'The game was not found at .*GameClient\.exe.*Start it yourself'
         }
 
+        It 'starts the first entry of a ClientLaunch list whose path exists, from its own folder' {
+            $r = New-TestLauncher -Name 'host-list-path\Server' -Override @{ ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}') }
+            $clientExe = Join-Path $TestDrive 'host-list-path\GameClient.exe'
+            Set-Content -LiteralPath $clientExe -Value 'exe'
+            Invoke-TestHost -Mode Local -Root $r.Destination | Should -Be 0
+            Should -Invoke Read-OgHostAnswer -Times 1 -Exactly
+            Should -Invoke Start-OgHostClientLaunch -Times 1 -Exactly
+            Should -Invoke Start-OgHostClientLaunch -Times 1 -Exactly -ParameterFilter {
+                $Target -eq $clientExe -and $WorkingDirectory -eq (Join-Path $TestDrive 'host-list-path')
+            }
+        }
+
+        It 'falls back to the Steam URI when the path entry is missing' {
+            $r = New-TestLauncher -Name 'host-list-uri\Server' -Override @{ ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}') }
+            Invoke-TestHost -Mode Local -Root $r.Destination | Should -Be 0
+            Should -Invoke Start-OgHostClientLaunch -Times 1 -Exactly
+            Should -Invoke Start-OgHostClientLaunch -Times 1 -Exactly -ParameterFilter {
+                $Target -eq 'steam://rungameid/480' -and -not $PesterBoundParameters.ContainsKey('WorkingDirectory')
+            }
+            Get-TestHostText | Should -Match 'Starting the game \(steam://rungameid/480\)\.'
+        }
+
+        It 'says why when no entry is usable (path missing, placeholder AppId), without asking' {
+            $r = New-TestLauncher -Name 'host-list-none\Server' -Override @{
+                ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}')
+                AppIds       = @{ game = 0 }
+            }
+            Invoke-TestHost -Mode Local -Root $r.Destination | Should -Be 0
+            Should -Invoke Read-OgHostAnswer -Times 0 -Exactly
+            Should -Invoke Start-OgHostClientLaunch -Times 0 -Exactly
+            $missing = [regex]::Escape((Join-Path $TestDrive 'host-list-none\GameClient.exe'))
+            Get-TestHostText | Should -Match ("Not starting the game automatically: the game was not found at '$missing'; " +
+                "the Steam app 'game' has no AppId yet \(placeholder 0\)\. Start it yourself\.")
+            Get-TestHostText | Should -Match "pick 'This PC'"
+        }
+
+        It 'prints only the hint when ClientLaunch is empty' {
+            $r = New-TestLauncher -Name 'host-list-empty' -Override @{ ClientLaunch = @() }
+            Invoke-TestHost -Mode Local -Root $r.Destination | Should -Be 0
+            Should -Invoke Read-OgHostAnswer -Times 0 -Exactly
+            Get-TestHostText | Should -Match 'Start the game yourself to play on this PC\.'
+        }
+
         It 'offers the game at once when ReadyLinePattern is empty' {
             $r = New-TestLauncher -Name 'host-noready' -Override @{ ReadyLinePattern = '' }
             $logQueue.Clear()
@@ -689,6 +781,56 @@ Describe 'host_server.ps1 helpers (real, unmocked)' {
             Close-OgHostLogTail $tail
         }
 
+        Context 'ClientLaunch selection (Resolve-OgHostClientLaunch)' {
+            BeforeAll {
+                $script:selectRoot = Join-Path $TestDrive 'select\Server'
+                New-Item -ItemType Directory -Path $selectRoot -Force | Out-Null
+                $script:presentExe = Join-Path $TestDrive 'select\GameClient.exe'
+                Set-Content -LiteralPath $presentExe -Value 'exe'
+                $script:missingExe = Join-Path $TestDrive 'select\Missing.exe'
+            }
+
+            It 'path exists: picks the path and its folder' {
+                $choice = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/480') } -Root $selectRoot
+                $choice.Target | Should -Be $presentExe
+                $choice.WorkingDirectory | Should -Be (Join-Path $TestDrive 'select')
+                @($choice.Reasons).Count | Should -Be 0
+            }
+
+            It 'path missing: falls through to the URI and remembers why' {
+                $choice = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('..\Missing.exe', 'steam://rungameid/480') } -Root $selectRoot
+                $choice.Target | Should -BeExactly 'steam://rungameid/480'
+                $choice.WorkingDirectory | Should -BeExactly ''
+                @($choice.Reasons) | Should -Be @("the game was not found at '$missingExe'")
+            }
+
+            It 'URI with a placeholder AppId: skipped for the next entry' {
+                $choice = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('steam://rungameid/{AppId:game}', '..\GameClient.exe') } -Root $selectRoot
+                $choice.Target | Should -Be $presentExe
+                @($choice.Reasons) | Should -Be @("the Steam app 'game' has no AppId yet (placeholder 0)")
+            }
+
+            It 'nothing usable: no target and every reason in list order' {
+                $choice = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('..\Missing.exe', 'steam://rungameid/{AppId:game}') } -Root $selectRoot
+                $choice.Target | Should -BeNullOrEmpty
+                @($choice.Reasons) | Should -Be @("the game was not found at '$missingExe'", "the Steam app 'game' has no AppId yet (placeholder 0)")
+            }
+
+            It 'keeps list order: a URI before an existing path wins' {
+                $choice = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('steam://rungameid/480', '..\GameClient.exe') } -Root $selectRoot
+                $choice.Target | Should -BeExactly 'steam://rungameid/480'
+            }
+
+            It 'accepts a single string and treats a missing or empty ClientLaunch as no entry' {
+                (Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = '..\GameClient.exe' } -Root $selectRoot).Target | Should -Be $presentExe
+                foreach ($settings in @(@{ ClientLaunch = @() }, @{ ClientLaunch = '' }, @{})) {
+                    $choice = Resolve-OgHostClientLaunch -Settings $settings -Root $selectRoot
+                    $choice.Target | Should -BeNullOrEmpty
+                    @($choice.Reasons).Count | Should -Be 0
+                }
+            }
+        }
+
         It 'rejects a damaged settings file' {
             $dir = Join-Path $TestDrive 'damaged'
             New-Item -ItemType Directory -Path $dir | Out-Null
@@ -699,7 +841,7 @@ Describe 'host_server.ps1 helpers (real, unmocked)' {
 
 Describe 'host_server.ps1 in both shells' {
     BeforeAll {
-        $script:generated = New-TestLauncher -Name 'shells'
+        $script:generated = New-TestLauncher -Name 'shells' -Override @{ ClientLaunch = @('..\Client\GameClient.exe', 'steam://rungameid/{AppId:game}') }
         $script:windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     }
 
@@ -726,6 +868,13 @@ Describe 'host_server.ps1 in both shells' {
 "friendly=`$(ConvertTo-OgHostFriendlyLine -Line 'GameSession: joined players=4 tested=3' -Pattern (New-Object System.Text.RegularExpressions.Regex(`$settings.JoinLinePattern)))"
 "shared=`$(Test-OgHostSharedAddress '100.100.1.1')"
 "box=`$((Format-OgHostBox @('ab'))[1])"
+"launch=`$(@(`$settings.ClientLaunch) -join ',')"
+`$exists = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('steam://rungameid/{AppId:g}', 'nope.exe', 'GameServer.exe', 'steam://rungameid/480') } -Root '$($generated.Destination)'
+"exists=`$(Split-Path -Leaf `$exists.Target) reasons=`$(@(`$exists.Reasons).Count)"
+`$fallback = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('nope.exe', 'steam://rungameid/480') } -Root '$($generated.Destination)'
+"fallback=`$(`$fallback.Target)"
+`$none = Resolve-OgHostClientLaunch -Settings @{ ClientLaunch = @('steam://rungameid/{AppId:g}') } -Root '$($generated.Destination)'
+"none=`$(`$null -eq `$none.Target) reason=`$(@(`$none.Reasons)[0])"
 "@
         $output = & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $probe 2>&1 | ForEach-Object { "$_" }
         $output | Should -Be @(
@@ -735,6 +884,10 @@ Describe 'host_server.ps1 in both shells' {
             'friendly=Player joined (4 players - above the tested 3, expect degraded performance)'
             'shared=True'
             'box=|  ab  |'
+            'launch=..\Client\GameClient.exe,steam://rungameid/480'
+            'exists=GameServer.exe reasons=2'
+            'fallback=steam://rungameid/480'
+            "none=True reason=the Steam app 'g' has no AppId yet (placeholder 0)"
         )
     }
 }

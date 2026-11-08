@@ -12,11 +12,14 @@ function Assert-OgServerLauncherSettings {
           JoinLinePattern  a valid .NET regex defining the named groups joined, left and players
                            (tested and local are optional)
           ReadyLinePattern '' or a valid .NET regex
-          ClientLaunch     '', a URI such as steam://rungameid/<id>, or a path relative to the
-                           launcher folder; {AppId:<app name>} tokens must name an app in AppNames
+          ClientLaunch     no entry, a single '', or one or more entries, each a URI such as
+                           steam://rungameid/<id> or a path relative to the launcher folder;
+                           {AppId:<app name>} tokens must name an app in AppNames; an entry of
+                           a list of two or more must not be empty
           ServerArguments, LocalHint  no line break
 
-        Every message has the form '<Prefix><Key>' <problem>.
+        Every message has the form '<Prefix><Key>' <problem>. A ClientLaunch entry of a list of two
+        or more is named ClientLaunch[<index>].
 
     .PARAMETER Prefix
         Text put in front of each key name in error messages, e.g. 'Apps[1].Depots[0].ServerLauncher.'.
@@ -31,20 +34,26 @@ function Assert-OgServerLauncherSettings {
         [AllowEmptyString()] [string] $ServerArguments = '',
         [AllowEmptyString()] [string] $JoinLinePattern,
         [AllowEmptyString()] [string] $ReadyLinePattern = '',
-        [AllowEmptyString()] [string] $ClientLaunch = '',
+        [AllowEmptyCollection()] [AllowEmptyString()] [string[]] $ClientLaunch = @(),
         [AllowEmptyString()] [string] $LocalHint = '',
         [string[]] $AppNames = @(),
         [string] $Prefix = ''
     )
+
+    $launchEntries = @($ClientLaunch)
+    $launchKey = {
+        param([int] $Index)
+        if ($launchEntries.Count -gt 1) { "ClientLaunch[$Index]" } else { 'ClientLaunch' }
+    }
 
     $values = [ordered]@{
         Title            = $Title
         ServerArguments  = $ServerArguments
         JoinLinePattern  = $JoinLinePattern
         ReadyLinePattern = $ReadyLinePattern
-        ClientLaunch     = $ClientLaunch
         LocalHint        = $LocalHint
     }
+    for ($i = 0; $i -lt $launchEntries.Count; $i++) { $values[(& $launchKey $i)] = $launchEntries[$i] }
     foreach ($key in $values.Keys) {
         if ([string]$values[$key] -match '[\r\n]') {
             throw "'$Prefix$key' must be a single line."
@@ -86,16 +95,24 @@ function Assert-OgServerLauncherSettings {
         }
     }
 
-    if ($ClientLaunch -ne '') {
-        foreach ($token in [regex]::Matches($ClientLaunch, '\{AppId:(?<name>[^}]*)\}')) {
+    for ($i = 0; $i -lt $launchEntries.Count; $i++) {
+        $entry = [string]$launchEntries[$i]
+        $key = "$Prefix$(& $launchKey $i)"
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            if ($launchEntries.Count -gt 1) {
+                throw "'$key' must not be empty."
+            }
+            continue
+        }
+        foreach ($token in [regex]::Matches($entry, '\{AppId:(?<name>[^}]*)\}')) {
             $name = $token.Groups['name'].Value
             if ($AppNames -notcontains $name) {
-                throw "'${Prefix}ClientLaunch' references unknown app '$name' in '$($token.Value)'. Known apps: $($AppNames -join ', ')."
+                throw "'$key' references unknown app '$name' in '$($token.Value)'. Known apps: $($AppNames -join ', ')."
             }
         }
-        $isUri = $ClientLaunch -match '^[A-Za-z][A-Za-z0-9+.-]+:'
-        if (-not $isUri -and [System.IO.Path]::IsPathRooted($ClientLaunch)) {
-            throw "'${Prefix}ClientLaunch' must be a URI or a path relative to the launcher folder, got '$ClientLaunch'."
+        $isUri = $entry -match '^[A-Za-z][A-Za-z0-9+.-]+:'
+        if (-not $isUri -and [System.IO.Path]::IsPathRooted($entry)) {
+            throw "'$key' must be a URI or a path relative to the launcher folder, got '$entry'."
         }
     }
 }

@@ -50,9 +50,16 @@ function New-OgDirDiffRequest {
         Builds one per-repo request for Open-OgDirDiffSet: which repo, and which comparison to open.
 
     .DESCRIPTION
-        The request type every directory-diff mode shares (working tree, -Staged, -Against, a commit).
-        It is validated here, and again by Open-OgDirDiffSet, so a hand-built object with the same
-        properties works too.
+        The request type every directory-diff mode shares (working tree, -Staged, -Against, a commit, a
+        range between two root commits, a root commit against the working tree). It is validated here,
+        and again by Open-OgDirDiffSet, so a hand-built object with the same properties works too.
+
+        Which revisions each kind takes:
+          Range        -BaseRev and -HeadRev, both required ('' = an empty side).
+          WorkingTree  -BaseRev optional (od task 10): the commit the working tree is compared with, or ''
+                       for an empty base (every file Added). Without it the base is HEAD, as always.
+                       -HeadRev is refused: the head side IS the working tree.
+          Staged       neither: the index against HEAD.
 
     .PARAMETER Repo
         The repo's name (Resolve-OgRepoTree's Name, the folder leaf). Names the repo folder in the run
@@ -69,7 +76,9 @@ function New-OgDirDiffRequest {
         WorkingTree, Staged or Range, as Get-OgDiffChange.
 
     .PARAMETER BaseRev
-        Range only, and required for Range: the base revision, or '' for an empty base (an added repo).
+        Range (required) or WorkingTree (optional): the base revision, or '' for an empty base (an added
+        repo; for WorkingTree, a repo the base root commit does not contain). Omit it for a WorkingTree
+        request against HEAD: passing $null binds as '' (a [string] parameter), which IS the empty base.
 
     .PARAMETER HeadRev
         Range only, and required for Range: the head revision, or '' for an empty head (a removed repo).
@@ -90,11 +99,18 @@ function New-OgDirDiffRequest {
 
     .OUTPUTS
         PSCustomObject (Og.DirDiffRequest): Repo, Path, WorkingDirectory, Kind, BaseRev, HeadRev, Ref,
-        Range, Commit, GitDir. BaseRev/HeadRev are $null unless Kind is Range; GitDir is $null unless given.
+        Range, Commit, GitDir. BaseRev is $null unless given (Range, or WorkingTree with a base); HeadRev
+        is $null unless Kind is Range; GitDir is $null unless given. A WorkingTree request whose BaseRev is
+        $null compares against HEAD; '' is an empty base.
 
     .EXAMPLE
         New-OgDirDiffRequest -Repo og-tools -Path tools/og-tools -WorkingDirectory C:\dev\proj\tools\og-tools `
             -Kind Range -BaseRev $old -HeadRev $new
+
+    .EXAMPLE
+        New-OgDirDiffRequest -Repo og-tools -Path tools/og-tools -WorkingDirectory C:\dev\proj\tools\og-tools `
+            -Kind WorkingTree -BaseRev $pinAtA
+        # The working tree (untracked files included) against the commit $pinAtA.
     #>
     [CmdletBinding()]
     param(
@@ -131,11 +147,23 @@ function New-OgDirDiffRequest {
     # "given" is read from $PSBoundParameters, never from the value.
     $hasBase = $PSBoundParameters.ContainsKey('BaseRev')
     $hasHead = $PSBoundParameters.ContainsKey('HeadRev')
-    if ($Kind -eq 'Range' -and -not ($hasBase -and $hasHead)) {
-        throw "New-OgDirDiffRequest -Kind Range needs both -BaseRev and -HeadRev ('' for an empty side)."
-    }
-    if ($Kind -ne 'Range' -and ($hasBase -or $hasHead)) {
-        throw "New-OgDirDiffRequest -Kind $Kind compares against HEAD; -BaseRev/-HeadRev belong to -Kind Range."
+    switch ($Kind) {
+        'Range' {
+            if (-not ($hasBase -and $hasHead)) {
+                throw "New-OgDirDiffRequest -Kind Range needs both -BaseRev and -HeadRev ('' for an empty side)."
+            }
+        }
+        'WorkingTree' {
+            if ($hasHead) {
+                throw 'New-OgDirDiffRequest -Kind WorkingTree compares against the working tree; -HeadRev belongs to -Kind Range.'
+            }
+        }
+        'Staged' {
+            if ($hasBase -or $hasHead) {
+                throw 'New-OgDirDiffRequest -Kind Staged compares the index against HEAD; -BaseRev/-HeadRev belong to -Kind Range ' +
+                    '(and -BaseRev to -Kind WorkingTree).'
+            }
+        }
     }
     if ($Kind -ne 'Range' -and -not [string]::IsNullOrEmpty($GitDir)) {
         throw "New-OgDirDiffRequest -GitDir belongs to -Kind Range; -Kind $Kind needs the repo's work tree."
@@ -267,6 +295,14 @@ function Open-OgDirDiffSet {
         $req = $requests[$i]
         $listArgs = @{ WorkingDirectory = $req.WorkingDirectory; Kind = $req.Kind }
         if ($req.Kind -eq 'Range') { $listArgs.BaseRev = [string] $req.BaseRev; $listArgs.HeadRev = [string] $req.HeadRev }
+        # A WorkingTree base is forwarded ONLY when the request carries one: checked on the request's value
+        # ($null = none, against HEAD), never cast. `[string] $null` is '', and '' IS a value here: the
+        # EMPTY base, which would list every working-tree file as Added in every plain `oggitdiff`
+        # (od review 9). Range may cast above because Assert-OgDirDiffRequest has refused a $null rev.
+        $baseProp = $req.PSObject.Properties['BaseRev']
+        if ($req.Kind -eq 'WorkingTree' -and $null -ne $baseProp -and $null -ne $baseProp.Value) {
+            $listArgs.BaseRev = [string] $baseProp.Value
+        }
         $reqGitDir = Get-OgDirDiffRequestGitDir -Request $req
         if ($reqGitDir) { $listArgs.GitDir = $reqGitDir }
         try {
@@ -931,6 +967,12 @@ function Assert-OgDirDiffRequest {
     .SYNOPSIS
         Throws unless a request has what Open-OgDirDiffSet needs: Repo, WorkingDirectory, a valid Kind, and
         for a Range both BaseRev and HeadRev (non-null; '' is an empty side). A GitDir belongs to a Range.
+
+    .DESCRIPTION
+        The revisions per kind, as New-OgDirDiffRequest (od task 10): a WorkingTree request may carry a
+        BaseRev (non-null: its base; $null or no property: HEAD) and is refused when it carries a non-null
+        HeadRev, since its head side is the working tree and a silently ignored HeadRev would show the
+        caller a diff it did not ask for. A Staged request carries neither.
     #>
     [CmdletBinding()]
     param(
@@ -955,8 +997,18 @@ function Assert-OgDirDiffRequest {
                 throw "Open-OgDirDiffSet: request $Index is a Range without '$name' ('' for an empty side)."
             }
         }
-    } elseif (Get-OgDirDiffRequestGitDir -Request $Request) {
-        throw "Open-OgDirDiffSet: request $Index has a GitDir but Kind '$($Request.Kind)'; git-dir mode is Range only."
+    } else {
+        if (Get-OgDirDiffRequestGitDir -Request $Request) {
+            throw "Open-OgDirDiffSet: request $Index has a GitDir but Kind '$($Request.Kind)'; git-dir mode is Range only."
+        }
+        $refused = if ($Request.Kind -eq 'WorkingTree') { @('HeadRev') } else { @('BaseRev', 'HeadRev') }
+        foreach ($name in $refused) {
+            $prop = $Request.PSObject.Properties[$name]
+            if ($null -ne $prop -and $null -ne $prop.Value) {
+                throw "Open-OgDirDiffSet: request $Index is a $($Request.Kind) request with a '$name'; " +
+                    "$name belongs to a Range$(if ($name -eq 'BaseRev') { ' (or a WorkingTree)' })."
+            }
+        }
     }
 }
 

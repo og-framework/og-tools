@@ -265,6 +265,147 @@ Describe 'The key loop (Select-OgPickerRow) with mocked console seams' {
         }
     }
 
+    # od task 11a (R5): Space marks one end of a range; Enter, h and w return an Og.PickerChoice.
+    Context 'Marking a base and choosing a range' {
+        BeforeEach {
+            $script:Rows   = New-TestRows 12
+            $script:Model  = New-TestModel -Rows $script:Rows
+            $script:KSpace = [System.ConsoleKey]::Spacebar
+        }
+
+        It 'Enter without a mark returns today''s single commit: Kind Commit, the row''s sha as Commit and Sha, the row itself' {
+            Push-TestKeys @($script:KDown, $script:KDown, $script:KEnter)
+            $choice = Invoke-TestLoop $script:Model
+            @($choice).Count | Should -Be 1
+            $choice.PSObject.TypeNames[0] | Should -Be 'Og.PickerChoice'
+            ($choice.PSObject.Properties.Name -join ',') | Should -Be 'Kind,Commit,From,To,WorkingTree,Sha,Row'
+            $choice.Kind | Should -Be 'Commit'
+            $choice.Commit | Should -Be $script:Rows[2].Sha
+            $choice.Sha | Should -Be $script:Rows[2].Sha            # what Show-OgDiff -Pick (5b) reads until 11b
+            [object]::ReferenceEquals($choice.Row, $script:Rows[2]) | Should -BeTrue
+            $choice.From | Should -BeNullOrEmpty
+            $choice.To | Should -BeNullOrEmpty
+            $choice.WorkingTree | Should -BeFalse
+        }
+
+        It 'Space marks the selected row, the header names the base, and Space on the marked row clears the mark' {
+            Push-TestKeys @($script:KDown, $script:KSpace, $script:KSpace, $script:KEnter)
+            $choice = Invoke-TestLoop $script:Model
+            # Frames: start, after Down, after the 1st Space (marked), after the 2nd Space (cleared).
+            $script:Frames.Count | Should -Be 4
+            $script:Frames[1].Lines[0] | Should -BeExactly 'Pick a commit: proj  (2/12)'
+            $script:Frames[2].Lines[0] | Should -BeExactly 'Pick a commit: proj  (2/12)  base: r01____'
+            $script:Frames[2].Lines[2] | Should -BeLike '>*r01____  2026-10-22 21:01  *'
+            @($script:Frames[2].Lines[1..5] | Where-Object { $_[1] -eq '*' }).Count | Should -Be 1
+            $script:Frames[3].Lines[0] | Should -BeExactly 'Pick a commit: proj  (2/12)'
+            @($script:Frames[3].Lines[1..5] | Where-Object { $_[1] -eq '*' }).Count | Should -Be 0
+            $script:Frames[3].Lines[2] | Should -BeLike '> r01____*'
+            # No mark left: Enter is the single commit again.
+            $choice.Kind | Should -Be 'Commit'
+            $choice.Commit | Should -Be $script:Rows[1].Sha
+        }
+
+        It 'keeps one mark at a time: Space on another row moves the mark there' {
+            Push-TestKeys @($script:KSpace, $script:KDown, $script:KDown, $script:KSpace, $script:KEsc)
+            $null = Invoke-TestLoop $script:Model
+            $last = $script:Frames[-1]
+            @($last.Lines[1..5] | Where-Object { $_[1] -eq '*' }).Count | Should -Be 1
+            $last.Lines[3] | Should -BeLike '>*r02____*'
+            $last.Lines[1] | Should -BeLike '  r00____*'
+            $last.Lines[0] | Should -BeExactly 'Pick a commit: proj  (3/12)  base: r02____'
+        }
+
+        It 'Enter with a mark returns older..newer whichever row was marked first (<name>)' -TestCases @(
+            @{ name = 'marked the newer row, then moved down'; keys = @('Down', 'Space', 'Down', 'Down', 'Down', 'Enter') }
+            @{ name = 'marked the older row, then moved up';   keys = @('Down', 'Down', 'Down', 'Down', 'Space', 'Up', 'Up', 'Up', 'Enter') }
+        ) {
+            $map = @{ Down = $script:KDown; Up = $script:KUp; Space = $script:KSpace; Enter = $script:KEnter }
+            Push-TestKeys @($keys | ForEach-Object { $map[$_] })
+            $choice = Invoke-TestLoop $script:Model
+            $choice.Kind | Should -Be 'Range'
+            $choice.From | Should -Be $script:Rows[4].Sha      # the LOWER row: the older commit is the base
+            $choice.To | Should -Be $script:Rows[1].Sha
+            $choice.Commit | Should -BeNullOrEmpty
+            $choice.Sha | Should -BeNullOrEmpty                # never routed down the single-commit path
+            $choice.WorkingTree | Should -BeFalse
+            # The frame before Enter: both ends visible, the mark on one, the header naming the OLDER row as the base.
+            $before = $script:Frames[-1]
+            $before.Lines[0] | Should -BeLike '*  base: r04____'
+            @($before.Lines[1..5] | Where-Object { $_[1] -eq '*' }).Count | Should -Be 1
+        }
+
+        It 'Enter on the marked row itself does nothing: the picker stays open and the next keys still work' {
+            Push-TestKeys @($script:KDown, $script:KSpace, $script:KEnter, $script:KUp, $script:KEnter)
+            $choice = Invoke-TestLoop $script:Model
+            @($script:Events) | Should -Be @('enter', 'draw', 'key', 'draw', 'key', 'draw', 'key', 'draw', 'key', 'draw', 'key', 'exit')
+            # The no-op Enter redrew the same screen.
+            ($script:Frames[3].Lines -join "`n") | Should -BeExactly ($script:Frames[2].Lines -join "`n")
+            $script:Frames[3].Highlight | Should -Be $script:Frames[2].Highlight
+            $choice.Kind | Should -Be 'Range'
+            $choice.From | Should -Be $script:Rows[1].Sha
+            $choice.To | Should -Be $script:Rows[0].Sha
+        }
+
+        It '<name> returns selected..HEAD (Kind Range, To HEAD), with or without a mark' -TestCases @(
+            @{ name = 'h';                   keys = @('Down', 'Down', 'h') }
+            @{ name = 'H';                   keys = @('Down', 'Down', 'H') }
+            @{ name = 'h with a mark below'; keys = @('Down', 'Down', 'Down', 'Space', 'Up', 'h') }
+        ) {
+            $map = @{ Down = $script:KDown; Up = $script:KUp; Space = $script:KSpace }
+            Push-TestKeys @($keys | ForEach-Object { if ($map.ContainsKey($_)) { $map[$_] } else { $_ } })
+            $choice = Invoke-TestLoop $script:Model
+            $choice.Kind | Should -Be 'Range'
+            $choice.From | Should -Be $script:Rows[2].Sha
+            $choice.To | Should -BeExactly 'HEAD'
+            $choice.Sha | Should -BeNullOrEmpty
+            $choice.WorkingTree | Should -BeFalse
+            [object]::ReferenceEquals($choice.Row, $script:Rows[2]) | Should -BeTrue
+        }
+
+        It '<name> returns selected..the working tree (Kind WorkingTree), with or without a mark' -TestCases @(
+            @{ name = 'w';                   keys = @('Down', 'Down', 'w') }
+            @{ name = 'W';                   keys = @('Down', 'Down', 'W') }
+            @{ name = 'w with a mark above'; keys = @('Space', 'Down', 'Down', 'w') }
+        ) {
+            $map = @{ Down = $script:KDown; Space = $script:KSpace }
+            Push-TestKeys @($keys | ForEach-Object { if ($map.ContainsKey($_)) { $map[$_] } else { $_ } })
+            $choice = Invoke-TestLoop $script:Model
+            $choice.Kind | Should -Be 'WorkingTree'
+            $choice.From | Should -Be $script:Rows[2].Sha
+            $choice.To | Should -BeNullOrEmpty
+            $choice.WorkingTree | Should -BeTrue
+            $choice.Sha | Should -BeNullOrEmpty
+            $choice.Commit | Should -BeNullOrEmpty
+        }
+
+        It 'emits the <name> choice downstream only after the screen is restored' -TestCases @(
+            @{ name = 'range';        keys = @('Space', 'Down', 'Enter'); kind = 'Range' }
+            @{ name = 'HEAD';         keys = @('Down', 'h');              kind = 'Range' }
+            @{ name = 'working tree'; keys = @('Down', 'w');              kind = 'WorkingTree' }
+        ) {
+            $map = @{ Down = $script:KDown; Space = $script:KSpace; Enter = $script:KEnter }
+            Push-TestKeys @($keys | ForEach-Object { if ($map.ContainsKey($_)) { $map[$_] } else { $_ } })
+            $seen = InModuleScope og-framework -Parameters @{ M = $script:Model; E = $script:Events } {
+                Select-OgPickerRow -Model $M | ForEach-Object { $E.Add('out'); $_ }
+            }
+            $script:Events[-2] | Should -Be 'exit'
+            $script:Events[-1] | Should -Be 'out'
+            @($script:Events | Where-Object { $_ -eq 'exit' }).Count | Should -Be 1
+            $seen.Kind | Should -Be $kind
+        }
+
+        It 'keeps the detail line on the SELECTED row''s own cascade while another row is marked, and resolves nothing extra' {
+            $resolver = { param($sha) $script:Calls.Add($sha); New-TestEntry -Repo ('repo' + $sha.Substring(3, 2)) }
+            $model = New-TestModel -Rows $script:Rows -Resolver $resolver
+            Push-TestKeys @($script:KSpace, $script:KDown, $script:KDown, $script:KEsc)
+            $null = Invoke-TestLoop $model
+            $script:Frames[-1].Lines[6] | Should -BeLike '  repos: repo02 *'
+            $script:Frames[-1].Lines[0] | Should -BeLike '*  base: r02____'
+            # Rows 0..4 once each (the viewport), as without a mark.
+            @($script:Calls) | Should -Be @(0..4 | ForEach-Object { $script:Rows[$_].Sha })
+        }
+    }
+
     Context 'Scrolling at the edges (viewport of 5 rows)' {
         It 'scrolls by exactly one row when the selection passes the bottom edge, and back at the top edge' {
             $rows  = New-TestRows 12
@@ -434,10 +575,34 @@ Describe 'The key loop (Select-OgPickerRow) with mocked console seams' {
             $picked = InModuleScope og-framework -Parameters @{ P = $repo; V = $resolver } {
                 Invoke-OgDiffPicker -ProjectRoot $P -Count 5 -TouchResolver $V
             }
-            $picked.Subject | Should -Be 'older'
+            # od task 11a: the picker returns an Og.PickerChoice; the row is its Row (Subject and Entries moved there).
+            $picked.Kind | Should -Be 'Commit'
+            $picked.Row.Subject | Should -Be 'older'
             $picked.Sha | Should -Be (Invoke-TestGit $repo rev-parse HEAD~1)
-            $picked.Entries[0].HeadRev | Should -Be $picked.Sha
+            $picked.Commit | Should -Be $picked.Sha
+            $picked.Row.Entries[0].HeadRev | Should -Be $picked.Sha
             $script:Frames[0].Lines[0] | Should -Be "Pick a commit: $(Split-Path $repo -Leaf)  (1/2)"
+            Should -Invoke Start-OgDiffToolProcess -ModuleName og-framework -Times 0 -Exactly
+            Get-TestRepoFingerprint $repo | Should -Be $before
+        }
+
+        It 'returns a range of the temp repo''s real commits: mark the newer, move to the older, Enter (od task 11a)' {
+            Mock Start-OgDiffToolProcess -ModuleName og-framework { throw 'must not launch' }
+            $repo = New-TestDir 'dryrange'
+            Invoke-TestGit $repo init -q | Out-Null
+            Add-TestCommit -Dir $repo -Message 'first'
+            Add-TestCommit -Dir $repo -Message 'second'
+            Add-TestCommit -Dir $repo -Message 'third'
+            $before = Get-TestRepoFingerprint $repo
+
+            Push-TestKeys @([System.ConsoleKey]::Spacebar, $script:KDown, $script:KDown, $script:KEnter)
+            $choice = InModuleScope og-framework -Parameters @{ P = $repo } { Invoke-OgDiffPicker -ProjectRoot $P }
+            $choice.Kind | Should -Be 'Range'
+            $choice.From | Should -Be (Invoke-TestGit $repo rev-parse HEAD~2)
+            $choice.To | Should -Be (Invoke-TestGit $repo rev-parse HEAD)
+            $choice.Row.Subject | Should -Be 'first'
+            $short = (Invoke-TestGit $repo rev-parse --short HEAD~2)
+            $script:Frames[-1].Lines[0] | Should -Be "Pick a commit: $(Split-Path $repo -Leaf)  (3/3)  base: $short"
             Should -Invoke Start-OgDiffToolProcess -ModuleName og-framework -Times 0 -Exactly
             Get-TestRepoFingerprint $repo | Should -Be $before
         }
@@ -475,7 +640,8 @@ Describe 'The pure renderer (Format-OgPickerScreen)' {
         $lines[6] | Should -BeExactly ''    # viewport line 6 of 6: past the 5th row
         $lines[7] | Should -BeExactly ('  repos: proj 1111111..2222222, og-sim 0000000..3333333 (added), ' +
                                        'old 4444444..0000000 (removed), lib (missing-commit)')
-        $lines[8] | Should -BeExactly 'Up/Down PgUp/PgDn Home/End: move   Enter: open   Esc/q: cancel'
+        # od task 11a: the footer lists the range keys (it was 'Up/Down PgUp/PgDn Home/End: move   Enter: open   Esc/q: cancel').
+        $lines[8] | Should -BeExactly 'Space: mark  Enter: open  h: vs HEAD  w: vs working tree  Esc/q: cancel'
     }
 
     It 'moves the marker with the selection and shows the unresolved detail as an ellipsis' {
@@ -510,7 +676,7 @@ Describe 'The pure renderer (Format-OgPickerScreen)' {
     }
 
     It 'drops the footer, then the header, then the detail line in short windows' -TestCases @(
-        @{ H = 4; First = 'Pick*';     Last = 'Up/Down*' }
+        @{ H = 4; First = 'Pick*';     Last = 'Space: mark*' }      # od task 11a: was 'Up/Down*' (the footer's text)
         @{ H = 3; First = 'Pick*';     Last = '  repos:*' }
         @{ H = 2; First = '> r00*';    Last = '  repos:*' }
         @{ H = 1; First = '> r00*';    Last = '> r00*' }
@@ -533,6 +699,70 @@ Describe 'The pure renderer (Format-OgPickerScreen)' {
         $rows = New-TestRows 1
         $rows[0].Touched = '-'; $rows[0].Entries = @()
         (Invoke-TestRender -Rows $rows -Selected 0 -Top 0 -Width 200 -Height 4)[2] | Should -BeExactly '  repos: none touched'
+    }
+
+    # od task 11a: the mark column and the header's base.
+    It 'marks the marked row with * in the second marker column, keeping every other column where it was' {
+        $lines = [string[]] @(InModuleScope og-framework -Parameters @{ R = $script:R } {
+            Format-OgPickerScreen -Rows $R -Selected 0 -Top 0 -Width 200 -Height 9 -Title 'proj' -Marked 2
+        })
+        $lines[1] | Should -BeExactly ('> r00____  2026-10-22 21:00  ' + 'root +2'.PadRight(12) + '  subject 0')
+        $lines[3] | Should -BeExactly (' *r02____  2026-10-22 21:02  ' + $script:Ell.PadRight(12) + '  subject 2')
+        $lines[3].Substring(29, 12) | Should -Be $script:Ell.PadRight(12)     # the touched column's offset is unchanged
+        $lines[2] | Should -BeLike '  r01____*'
+        $lines[0] | Should -BeExactly 'Pick a commit: proj  (1/5)  base: r02____'
+        # The detail line is the SELECTED row's, not the marked one's.
+        $lines[7] | Should -BeLike '  repos: proj 1111111..2222222, *'
+    }
+
+    It 'shows both markers on a selected marked row' {
+        $lines = [string[]] @(InModuleScope og-framework -Parameters @{ R = $script:R } {
+            Format-OgPickerScreen -Rows $R -Selected 3 -Top 0 -Width 200 -Height 9 -Title 'proj' -Marked 3
+        })
+        $lines[4] | Should -BeLike '>*r03____  2026-10-22 21:03  *'
+        @($lines[1..5] | Where-Object { $_[1] -eq '*' }).Count | Should -Be 1
+        @($lines[1..5] | Where-Object { $_[0] -eq '>' }).Count | Should -Be 1
+        $lines[0] | Should -BeExactly 'Pick a commit: proj  (4/5)  base: r03____'
+    }
+
+    It 'names the base Enter would use: the older (lower) of the marked and the selected row (selected <s>, marked <m>)' -TestCases @(
+        @{ s = 0; m = 3; base = 'r03____' }     # marked below the selection: the mark is the base
+        @{ s = 4; m = 1; base = 'r04____' }     # selection below the mark: the SELECTED row is the base
+        @{ s = 2; m = 2; base = 'r02____' }     # on the mark
+    ) {
+        $lines = [string[]] @(InModuleScope og-framework -Parameters @{ R = $script:R; S = $s; M = $m } {
+            Format-OgPickerScreen -Rows $R -Selected $S -Top 0 -Width 200 -Height 9 -Title 'proj' -Marked $M
+        })
+        $lines[0] | Should -BeExactly "Pick a commit: proj  ($($s + 1)/5)  base: $base"
+    }
+
+    It 'shows no base and no * without a mark (-Marked -1, the default, or out of range)' -TestCases @(
+        @{ m = -1 }, @{ m = 5 }
+    ) {
+        $lines = [string[]] @(InModuleScope og-framework -Parameters @{ R = $script:R; M = $m } {
+            Format-OgPickerScreen -Rows $R -Selected 0 -Top 0 -Width 200 -Height 9 -Title 'proj' -Marked $M
+        })
+        $lines[0] | Should -BeExactly 'Pick a commit: proj  (1/5)'
+        @($lines[1..5] | Where-Object { $_.Length -gt 1 -and $_[1] -eq '*' }).Count | Should -Be 0
+    }
+
+    It 'never returns a line longer than the width with a mark, for every width from 1 to 90' {
+        for ($w = 1; $w -le 90; $w++) {
+            $lines = [string[]] @(InModuleScope og-framework -Parameters @{ R = $script:R; W = $w } {
+                Format-OgPickerScreen -Rows $R -Selected 1 -Top 0 -Width $W -Height 9 -Title 'proj' -Marked 3
+            })
+            foreach ($l in $lines) { $l.Length | Should -BeLessOrEqual $w }
+        }
+    }
+
+    It 'the footer at width <w> is "<e>"' -TestCases @(
+        @{ w = 200; e = 'Space: mark  Enter: open  h: vs HEAD  w: vs working tree  Esc/q: cancel' }
+        @{ w = 71;  e = 'Space: mark  Enter: open  h: vs HEAD  w: vs working tree  Esc/q: cancel' }
+        @{ w = 70;  e = 'Space:mark Enter:open h:HEAD w:worktree Esc/q:cancel' }
+        @{ w = 52;  e = 'Space:mark Enter:open h:HEAD w:worktree Esc/q:cancel' }
+        @{ w = 30;  e = "Space:mark Enter:open h:HEAD $([char] 0x2026)" }
+    ) {
+        (Invoke-TestRender -Rows $script:R -Selected 0 -Top 0 -Width $w -Height 9)[8] | Should -BeExactly $e
     }
 }
 
@@ -564,9 +794,44 @@ Describe 'The pure helpers' {
         @{ name = 'Esc';    key = [System.ConsoleKey]::Escape;    char = [char] 27;  action = 'Cancel' }
         @{ name = 'q';      key = [System.ConsoleKey]::Q;         char = [char] 'q'; action = 'Cancel' }
         @{ name = 'x';      key = [System.ConsoleKey]::X;         char = [char] 'x'; action = 'None' }
+        @{ name = 'Space';  key = [System.ConsoleKey]::Spacebar;  char = [char] ' '; action = 'Mark' }
+        @{ name = 'h';      key = [System.ConsoleKey]::H;         char = [char] 'h'; action = 'VsHead' }
+        @{ name = 'H';      key = [System.ConsoleKey]::H;         char = [char] 'H'; action = 'VsHead' }
+        @{ name = 'w';      key = [System.ConsoleKey]::W;         char = [char] 'w'; action = 'VsWorkingTree' }
+        @{ name = 'W';      key = [System.ConsoleKey]::W;         char = [char] 'W'; action = 'VsWorkingTree' }
     ) {
         $k = New-TestKey $key $char
         InModuleScope og-framework -Parameters @{ K = $k } { Get-OgPickerKeyAction -Key $K } | Should -Be $action
+    }
+
+    # od task 11a: the pure choice rule. Rows are newest first: a higher index is an older commit.
+    It 'Get-OgPickerChoice(<a>, selected <s>, marked <m>) is <kind> <from>..<to>' -TestCases @(
+        @{ a = 'Pick';          s = 2; m = -1; kind = 'Commit';      commit = 2;  from = $null; to = $null }
+        @{ a = 'Pick';          s = 1; m = 4;  kind = 'Range';       commit = $null; from = 4; to = 1 }
+        @{ a = 'Pick';          s = 4; m = 1;  kind = 'Range';       commit = $null; from = 4; to = 1 }
+        @{ a = 'Pick';          s = 0; m = 11; kind = 'Range';       commit = $null; from = 11; to = 0 }
+        @{ a = 'Pick';          s = 3; m = 3;  kind = $null;         commit = $null; from = $null; to = $null }
+        @{ a = 'VsHead';        s = 3; m = -1; kind = 'Range';       commit = $null; from = 3; to = 'HEAD' }
+        @{ a = 'VsHead';        s = 3; m = 7;  kind = 'Range';       commit = $null; from = 3; to = 'HEAD' }
+        @{ a = 'VsWorkingTree'; s = 5; m = -1; kind = 'WorkingTree'; commit = $null; from = 5; to = $null }
+        @{ a = 'VsWorkingTree'; s = 5; m = 0;  kind = 'WorkingTree'; commit = $null; from = 5; to = $null }
+        @{ a = 'Down';          s = 5; m = 0;  kind = $null;         commit = $null; from = $null; to = $null }
+        @{ a = 'Mark';          s = 5; m = -1; kind = $null;         commit = $null; from = $null; to = $null }
+    ) {
+        $rows = New-TestRows 12
+        $choice = InModuleScope og-framework -Parameters @{ R = $rows; A = $a; S = $s; M = $m } {
+            Get-OgPickerChoice -Rows $R -Action $A -Selected $S -Marked $M
+        }
+        if ($null -eq $kind) { $choice | Should -BeNullOrEmpty; return }
+        $sha = { param($v) if ($null -eq $v) { $null } elseif ($v -is [string]) { $v } else { $rows[$v].Sha } }
+        $choice.PSObject.TypeNames[0] | Should -Be 'Og.PickerChoice'
+        $choice.Kind | Should -Be $kind
+        $choice.Commit | Should -Be (& $sha $commit)
+        $choice.Sha | Should -Be (& $sha $commit)
+        $choice.From | Should -Be (& $sha $from)
+        $choice.To | Should -Be (& $sha $to)
+        $choice.WorkingTree | Should -Be ($kind -eq 'WorkingTree')
+        [object]::ReferenceEquals($choice.Row, $rows[$s]) | Should -BeTrue
     }
 
     It 'ConvertTo-OgPickerFitted("<text>", <w>) is "<e>"' -TestCases @(

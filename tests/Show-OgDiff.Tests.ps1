@@ -352,61 +352,6 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
             }
         }
 
-        It 'MERGE-BASE, NOT REF: exported base tree matches git merge-base <ref> HEAD, never <ref>''s own tip' {
-            # <ref> (main) advances AFTER the branch point, so merge-base and <ref>'s tip are
-            # provably different trees here -- only the merge-base is correct.
-            $repo = New-TestGitRepo
-            try {
-                git-in $repo checkout -b feat | Out-Null
-                Set-Content -LiteralPath (Join-Path $repo 'feat-only.txt') -Value "feat`n" -NoNewline
-                git-in $repo add . | Out-Null
-                git-in $repo commit -m 'feat-only change' | Out-Null
-
-                git-in $repo checkout main | Out-Null
-                Set-Content -LiteralPath (Join-Path $repo 'main-only.txt') -Value "main`n" -NoNewline
-                git-in $repo add . | Out-Null
-                git-in $repo commit -m 'main-only change' | Out-Null
-
-                git-in $repo checkout feat | Out-Null
-
-                # Oracle: merge-base(main, HEAD) and main's own tip are different trees here, and
-                # only the merge-base tree lacks main-only.txt. git-in collapses multi-line stdout
-                # into one trimmed string, so split back into lines before using -Contain on it.
-                $mergeBase = git-in $repo merge-base main HEAD
-                $refTip    = git-in $repo rev-parse main
-                $mergeBase | Should -Not -Be $refTip
-                $mergeBaseFiles = (git-in $repo ls-tree -r --name-only $mergeBase) -split '\r?\n'
-                $refTipFiles    = (git-in $repo ls-tree -r --name-only $refTip)    -split '\r?\n'
-                $mergeBaseFiles | Should -Not -Contain 'main-only.txt'
-                $refTipFiles    | Should -Contain 'main-only.txt'
-
-                git-in $repo config diff.tool captest | Out-Null
-                git-in $repo config difftool.captest.cmd '"C:\Tools\FakeTool.exe" "$LOCAL" "$REMOTE"' | Out-Null
-                Mock -ModuleName og-framework -CommandName Start-OgDiffToolProcess -MockWith { }
-
-                $r = Show-OgDiff -ProjectRoot $repo -Against main -DirDiff
-                $r.Action | Should -Be 'opened'
-
-                # od task 3 adaptation: the export is SPARSE now (changed files only), so the unchanged
-                # file.txt is on neither side; the old full-tree export had it on both.
-                # Base = merge-base: neither branch's own commit is present. Had <ref>'s tip been the
-                # base, main-only.txt would sit on the base side as a file this branch "deleted".
-                Test-Path -LiteralPath (Join-Path $r.BasePath 'main-only.txt') | Should -Be $false
-                Test-Path -LiteralPath (Join-Path $r.BasePath 'feat-only.txt') | Should -Be $false
-                Test-Path -LiteralPath (Join-Path $r.BasePath 'file.txt')      | Should -Be $false
-                $r.BaseRev | Should -Be $mergeBase
-                Split-Path $r.BasePath -Leaf | Should -Be ("$($r.Repo) base " + $mergeBase.Substring(0, 7))
-
-                # Head = HEAD (feat): feat's own commit is present, main's is not.
-                Test-Path -LiteralPath (Join-Path $r.HeadPath 'feat-only.txt') | Should -Be $true
-                Test-Path -LiteralPath (Join-Path $r.HeadPath 'main-only.txt') | Should -Be $false
-                Test-Path -LiteralPath (Join-Path $r.HeadPath 'file.txt')      | Should -Be $false
-            } finally {
-                Remove-Item -Recurse -Force $repo -ErrorAction SilentlyContinue
-                Remove-OgDiffExportRoot -RepoPath $repo
-            }
-        }
-
         It 'a clean repo (-Against -DirDiff, HEAD == ref) exports nothing and launches nothing' {
             $repo = New-TestGitRepo
             try {
@@ -451,10 +396,16 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
     }
 
     Context '-PerFile: the per-file git difftool path, as before directory diffs became the default' {
-        # The two tests below are the pre-task-3 default-mode tests, moved here with -PerFile added: they
+        # The tests below are the pre-task-3 default-mode tests, moved here with -PerFile added: they
         # assert git difftool's arguments, which only the per-file path still uses.
 
-        It '-PerFile reports opened for an unstaged edit, invoking difftool with plain --no-prompt (no range)' {
+        # od task 13: one data-driven test for the two unstaged-edit cases (they built the same repo and asserted
+        # the same thing, git difftool's exact arguments): plain -PerFile, and -PerFile -DirDiff -Tool, where
+        # -DirDiff must stay a no-op (never --dir-diff). Neither launches the directory-diff tool.
+        It '-PerFile on an unstaged edit reports opened and runs plain per-file git difftool with exactly the expected arguments, never --dir-diff (<Name>)' -ForEach @(
+            @{ Name = 'plain -PerFile'; Extra = @{}; Want = @('difftool', '--no-prompt') }
+            @{ Name = '-PerFile -DirDiff -Tool captest'; Extra = @{ DirDiff = $true; Tool = 'captest' }; Want = @('difftool', '--no-prompt', '--tool=captest') }
+        ) {
             $repo = New-TestGitRepo
             try {
                 Set-Content -LiteralPath (Join-Path $repo 'file.txt') -Value "dirty`n" -NoNewline
@@ -466,9 +417,11 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
                         [PSCustomObject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; WorkingDirectory = $WorkingDirectory }
                     }
 
-                $r = Show-OgDiff -ProjectRoot $repo -PerFile
+                $r = Show-OgDiff -ProjectRoot $repo -PerFile @Extra
                 $r.Action | Should -Be 'opened'
-                $script:capturedArgs | Should -Be @('difftool', '--no-prompt')
+                $script:capturedArgs | Should -Be $Want
+                $script:capturedArgs | Should -Not -Contain '--dir-diff'
+                $script:Launches.Count | Should -Be 0
             } finally { Remove-Item -Recurse -Force $repo }
         }
 
@@ -491,24 +444,6 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
             } finally { Remove-Item -Recurse -Force $repo }
         }
 
-        It '-PerFile -DirDiff runs plain per-file git difftool, never --dir-diff' {
-            $repo = New-TestGitRepo
-            try {
-                Set-Content -LiteralPath (Join-Path $repo 'file.txt') -Value "dirty`n" -NoNewline
-
-                Mock -ModuleName og-framework -CommandName Invoke-Git `
-                    -ParameterFilter { $Arguments -contains 'difftool' } `
-                    -MockWith {
-                        $script:capturedArgs = $Arguments
-                        [PSCustomObject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; WorkingDirectory = $WorkingDirectory }
-                    }
-
-                $r = Show-OgDiff -ProjectRoot $repo -PerFile -DirDiff -Tool captest
-                $r.Action | Should -Be 'opened'
-                $script:capturedArgs | Should -Be @('difftool', '--no-prompt', '--tool=captest')
-                $script:Launches.Count | Should -Be 0
-            } finally { Remove-Item -Recurse -Force $repo }
-        }
     }
 
     Context 'od task 3: directory diffs by default, in one run, -PerFile kept' {
@@ -540,28 +475,31 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
                 $dir
             }
 
-            # A three-repo og tree: <base>\root with real submodules libs/a and libs/b (local clones).
+            # A three-repo og tree: <base>\root with real submodules libs/a and libs/b (local clones). Built once per
+            # file; each test gets its own filesystem copy (od task 13, Copy-TestFixture in OgGitTestHelpers.ps1).
             function New-TestTree3 {
-                $base = New-TestDir 'tree3'
-                foreach ($n in 'a', 'b') {
-                    $src = Join-Path $base "src-$n"
-                    [void] [System.IO.Directory]::CreateDirectory($src)
-                    Invoke-TestGit $src init -q | Out-Null
-                    Write-TestText $src "$n.txt" "one-$n`n"
-                    Invoke-TestGit $src add -- "$n.txt" | Out-Null
-                    Invoke-TestGit $src commit -q -m "one-$n" | Out-Null
+                Copy-TestFixture -Key 'tree3' -Builder {
+                    $base = New-TestDir 'tree3'
+                    foreach ($n in 'a', 'b') {
+                        $src = Join-Path $base "src-$n"
+                        [void] [System.IO.Directory]::CreateDirectory($src)
+                        Invoke-TestGit $src init -q | Out-Null
+                        Write-TestText $src "$n.txt" "one-$n`n"
+                        Invoke-TestGit $src add -- "$n.txt" | Out-Null
+                        Invoke-TestGit $src commit -q -m "one-$n" | Out-Null
+                    }
+                    $root = Join-Path $base 'root'
+                    [void] [System.IO.Directory]::CreateDirectory($root)
+                    Invoke-TestGit $root init -q | Out-Null
+                    Write-TestText $root 'r.txt' "root`n"
+                    Invoke-TestGit $root add -- 'r.txt' | Out-Null
+                    Invoke-TestGit $root commit -q -m 'root' | Out-Null
+                    foreach ($n in 'a', 'b') {
+                        Invoke-TestGit $root submodule add -q -- (Join-Path $base "src-$n") "libs/$n" | Out-Null
+                    }
+                    Invoke-TestGit $root commit -q -m 'add submodules' | Out-Null
+                    [PSCustomObject]@{ Root = $root; A = (Join-Path $root 'libs\a'); B = (Join-Path $root 'libs\b') }
                 }
-                $root = Join-Path $base 'root'
-                [void] [System.IO.Directory]::CreateDirectory($root)
-                Invoke-TestGit $root init -q | Out-Null
-                Write-TestText $root 'r.txt' "root`n"
-                Invoke-TestGit $root add -- 'r.txt' | Out-Null
-                Invoke-TestGit $root commit -q -m 'root' | Out-Null
-                foreach ($n in 'a', 'b') {
-                    Invoke-TestGit $root submodule add -q -- (Join-Path $base "src-$n") "libs/$n" | Out-Null
-                }
-                Invoke-TestGit $root commit -q -m 'add submodules' | Out-Null
-                [PSCustomObject]@{ Root = $root; A = (Join-Path $root 'libs\a'); B = (Join-Path $root 'libs\b') }
             }
 
             # feat branched off main; main then gained main-only.txt, feat gained feat-only.txt; feat checked out.
@@ -670,14 +608,24 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
             Get-TestFiles $r.HeadPath | Should -Be @('a.txt')
         }
 
-        It '-Against exports the merge base and HEAD (only the branch''s own changes), with Ref, Range and both revs' {
+        # od task 13: the item-2 test 'MERGE-BASE, NOT REF' (the same diverged branch, -Against main -DirDiff, and
+        # weaker side checks) is merged in here as the -DirDiff case, with its ls-tree oracle. -DirDiff is a no-op
+        # since od task 3, so both cases must give exactly these sides.
+        It '-Against exports the merge base and HEAD (only the branch''s own changes), with Ref, Range and both revs (<Name>)' -ForEach @(
+            @{ Name = '-Against main'; Extra = @{} }
+            @{ Name = '-Against main -DirDiff'; Extra = @{ DirDiff = $true } }
+        ) {
             $repo = New-TestDivergedRepo
             $mergeBase = Invoke-TestGit $repo merge-base main HEAD
             $head      = Invoke-TestGit $repo rev-parse HEAD
             $mainTip   = Invoke-TestGit $repo rev-parse main
             $mergeBase | Should -Not -Be $mainTip
+            # Oracle: only main's tip has main-only.txt, so a base taken from the ref's tip instead of the merge
+            # base would put main-only.txt on the base side as a file this branch "deleted".
+            @((Invoke-TestGit $repo ls-tree -r --name-only $mergeBase) -split '\r?\n') | Should -Not -Contain 'main-only.txt'
+            @((Invoke-TestGit $repo ls-tree -r --name-only $mainTip) -split '\r?\n')   | Should -Contain 'main-only.txt'
 
-            $r = Show-OgDiff -ProjectRoot $repo -Against main
+            $r = Show-OgDiff -ProjectRoot $repo -Against main @Extra
 
             $r.Action    | Should -Be 'opened'
             $r.Ref       | Should -Be 'main'
@@ -959,16 +907,23 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
             # Three levels on local remotes: project (root) -> libs/child -> libs/child/ext/nested, the nested
             # one added with oggitsubadd + oggitadd + oggitcommit (od task 4a's fixture: the newest root
             # commit IS the "added submodule" cascade).
+            # Every builder in this Context and below is built ONCE per file and hands each test its own filesystem
+            # copy (od task 13, Copy-TestFixture in OgGitTestHelpers.ps1): a test may commit, push, deinit or rm in
+            # its copy, and nothing reaches the next test. A rebuild per test cost ~18 s (two `git submodule add`,
+            # one `clone --recurse-submodules`); a copy costs ~0.3 s. Keep new mutating steps INSIDE the test, after
+            # the builder call, never inside a builder that other tests share.
             function New-OdCommitTree {
-                $p = New-TestProject
-                $nestedUrl = New-TestRemote -Root $p.Remotes -Name 'nested'
-                Add-OgSubmodule -Url $nestedUrl -Path 'libs/child/ext/nested' -ProjectRoot $p.Project | Out-Null
-                Add-OgChange -ProjectRoot $p.Project | Out-Null
-                New-OgCommit -Message 'add nested' -ProjectRoot $p.Project | Out-Null
-                $p.Child  = Join-Path $p.Project 'libs\child'
-                $p.Nested = Join-Path $p.Project 'libs\child\ext\nested'
-                $p.GitDir = Join-Path $p.Project '.git'
-                $p
+                Copy-TestFixture -Key 'od-commit-tree' -Builder {
+                    $p = New-TestProject
+                    $nestedUrl = New-TestRemote -Root $p.Remotes -Name 'nested'
+                    Add-OgSubmodule -Url $nestedUrl -Path 'libs/child/ext/nested' -ProjectRoot $p.Project | Out-Null
+                    Add-OgChange -ProjectRoot $p.Project | Out-Null
+                    New-OgCommit -Message 'add nested' -ProjectRoot $p.Project | Out-Null
+                    $p.Child  = Join-Path $p.Project 'libs\child'
+                    $p.Nested = Join-Path $p.Project 'libs\child\ext\nested'
+                    $p.GitDir = Join-Path $p.Project '.git'
+                    $p
+                }
             }
 
             # A full id, or a gitlink's pin with '<commit>:<path>'.
@@ -1008,30 +963,32 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
             # not the new pin's parent. Afterwards child and nested move ON past their new pins, so a diff
             # that used a submodule's tip instead of its pins would show other sides.
             function New-OdCascade {
-                $t = New-OdCommitTree
-                $t.OldRoot   = Get-OdRev $t.Project
-                $t.OldChild  = Get-OdRev $t.Project 'HEAD:libs/child'
-                $t.OldNested = Get-OdRev $t.Child 'HEAD:ext/nested'
+                Copy-TestFixture -Key 'od-cascade' -Builder {
+                    $t = New-OdCommitTree
+                    $t.OldRoot   = Get-OdRev $t.Project
+                    $t.OldChild  = Get-OdRev $t.Project 'HEAD:libs/child'
+                    $t.OldNested = Get-OdRev $t.Child 'HEAD:ext/nested'
 
-                Add-TestCommit -Dir $t.Nested -File 'manual.txt' -Content 'manual' -Message 'manual'
-                Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'nested changed'
-                Set-Content -LiteralPath (Join-Path $t.Child 'README.md')  -Value 'child changed'
-                Set-Content -LiteralPath (Join-Path $t.Child 'child.txt')  -Value 'child work'
-                Set-Content -LiteralPath (Join-Path $t.Project 'README.md') -Value 'root changed'
-                Set-Content -LiteralPath (Join-Path $t.Project 'root.txt')  -Value 'root work'
-                Add-OgChange -ProjectRoot $t.Project | Out-Null
-                New-OgCommit -Message 'cascade' -ProjectRoot $t.Project | Out-Null
+                    Add-TestCommit -Dir $t.Nested -File 'manual.txt' -Content 'manual' -Message 'manual'
+                    Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'nested changed'
+                    Set-Content -LiteralPath (Join-Path $t.Child 'README.md')  -Value 'child changed'
+                    Set-Content -LiteralPath (Join-Path $t.Child 'child.txt')  -Value 'child work'
+                    Set-Content -LiteralPath (Join-Path $t.Project 'README.md') -Value 'root changed'
+                    Set-Content -LiteralPath (Join-Path $t.Project 'root.txt')  -Value 'root work'
+                    Add-OgChange -ProjectRoot $t.Project | Out-Null
+                    New-OgCommit -Message 'cascade' -ProjectRoot $t.Project | Out-Null
 
-                $t.Sha       = Get-OdRev $t.Project
-                $t.NewChild  = Get-OdRev $t.Project 'HEAD:libs/child'
-                $t.NewNested = Get-OdRev $t.Child 'HEAD:ext/nested'
-                Get-OdRev $t.Nested "$($t.NewNested)^1" | Should -Not -Be $t.OldNested   # precondition: two commits
+                    $t.Sha       = Get-OdRev $t.Project
+                    $t.NewChild  = Get-OdRev $t.Project 'HEAD:libs/child'
+                    $t.NewNested = Get-OdRev $t.Child 'HEAD:ext/nested'
+                    Get-OdRev $t.Nested "$($t.NewNested)^1" | Should -Not -Be $t.OldNested   # precondition: two commits
 
-                Add-TestCommit -Dir $t.Nested -File 'later.txt' -Message 'later nested'
-                Add-TestCommit -Dir $t.Child  -File 'later.txt' -Message 'later child'
-                Get-OdRev $t.Child  | Should -Not -Be $t.NewChild    # precondition: the tips moved on
-                Get-OdRev $t.Nested | Should -Not -Be $t.NewNested
-                $t
+                    Add-TestCommit -Dir $t.Nested -File 'later.txt' -Message 'later nested'
+                    Add-TestCommit -Dir $t.Child  -File 'later.txt' -Message 'later child'
+                    Get-OdRev $t.Child  | Should -Not -Be $t.NewChild    # precondition: the tips moved on
+                    Get-OdRev $t.Nested | Should -Not -Be $t.NewNested
+                    $t
+                }
             }
 
             $script:OdResultFields = 'Repo,Path,Action,Error,Ref,Range,BasePath,HeadPath,Commit,BaseRev,HeadRev,FileCount,RunPath'
@@ -1399,15 +1356,18 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
                 # -Extra root-only commits on top, which push the cascades further down the list.
                 function New-OdPickTree {
                     param([int] $Extra = 0)
-                    $t = New-OdCascade
-                    Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'second cascade'
-                    Add-OgChange -ProjectRoot $t.Project | Out-Null
-                    New-OgCommit -Message 'second' -ProjectRoot $t.Project | Out-Null
-                    for ($i = 0; $i -lt $Extra; $i++) {
-                        Add-TestCommit -Dir $t.Project -File "extra$i.txt" -Message "extra $i"
+                    $t = Copy-TestFixture -Key "od-pick-$Extra" -Builder {
+                        $t = New-OdCascade
+                        Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'second cascade'
+                        Add-OgChange -ProjectRoot $t.Project | Out-Null
+                        New-OgCommit -Message 'second' -ProjectRoot $t.Project | Out-Null
+                        for ($i = 0; $i -lt $Extra; $i++) {
+                            Add-TestCommit -Dir $t.Project -File "extra$i.txt" -Message "extra $i"
+                        }
+                        # The picker's rows, newest first, by git's own first-parent log (the oracle).
+                        $t.Rows = @((Invoke-TestGit $t.Project log --first-parent --format=%H HEAD) -split "`r?`n" | Where-Object { $_ })
+                        $t
                     }
-                    # The picker's rows, newest first, by git's own first-parent log (the oracle).
-                    $t.Rows = @((Invoke-TestGit $t.Project log --first-parent --format=%H HEAD) -split "`r?`n" | Where-Object { $_ })
                     Reset-OdPickCounters
                     $t
                 }
@@ -1682,6 +1642,768 @@ Set-Content -LiteralPath $CaptureFile -Value ($found -join "`n")
                 Should -Invoke -ModuleName og-framework Enter-OgPickerScreen -Times 0
                 $script:Launches.Count | Should -Be 0
                 Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+            }
+
+            Context 'od task 11b: -Pick routes the choice: Enter = -Commit, a mark + Enter or h = -From/-To, w = -From -IncludeWorkingTree' {
+
+                BeforeAll {
+                    # One line per result: every field (Commit included, so $null and '' differ) and the side folders
+                    # relative to their run folder. Two runs never share a folder (a second run in the same second
+                    # gets a '-2' suffix), so RunPath is left out; each test checks the pick's run label itself.
+                    function Format-OdPickComparable {
+                        param([object[]] $Results)
+                        foreach ($x in $Results) {
+                            $rel = { param($p) if ($p) { $p.Substring($x.RunPath.Length) } else { '<null>' } }
+                            (@('Repo', 'Path', 'Action', 'Error', 'Ref', 'Range', 'Commit', 'BaseRev', 'HeadRev', 'FileCount' | ForEach-Object {
+                                "$_=$(if ($null -eq $x.$_) { '<null>' } else { $x.$_ })" }) +
+                             "BasePath=$(& $rel $x.BasePath)" + "HeadPath=$(& $rel $x.HeadPath)") -join '|'
+                        }
+                    }
+
+                    # The repos' pins at a root commit, read with git itself (the oracle).
+                    function Get-OdPinsAt {
+                        param($T, [string] $Root)
+                        $child = Get-OdRev $T.Project "${Root}:libs/child"
+                        @{ Root = $Root; Child = $child; Nested = (Get-OdRev $T.Child "${child}:ext/nested") }
+                    }
+
+                    # The pick's run happens only after the picker left its screen: every launch after the one 'exit'.
+                    function Assert-OdLaunchAfterExit {
+                        $exitAt = $script:PickEvents.IndexOf('exit')
+                        $exitAt | Should -BeGreaterThan 0
+                        @($script:PickEvents | Where-Object { $_ -eq 'exit' }).Count | Should -Be 1
+                        $script:PickEvents.IndexOf('launch') | Should -BeGreaterThan $exitAt
+                    }
+                }
+
+                BeforeEach {
+                    $script:KSpace = [System.ConsoleKey]::Spacebar
+                }
+
+                It 'Enter without a mark (Kind Commit) gives exactly the -Commit run of that row, field by field' {
+                    $t = New-OdPickTree
+                    Push-OdKeys @($script:KDown, $script:KEnter)
+
+                    $viaPick = @(Show-OgDiff -ProjectRoot $t.Project -Pick)
+                    $launchesPick = $script:Launches.Count
+                    $viaCommit = @(Show-OgDiff -ProjectRoot $t.Project -Commit $t.Rows[1])
+
+                    $viaPick.Count | Should -Be 3
+                    (Format-OdPickComparable $viaPick) | Should -Be (Format-OdPickComparable $viaCommit)
+                    $viaPick | ForEach-Object { $_.Commit | Should -Be $t.Rows[1] }
+                    Split-Path $viaPick[0].RunPath -Leaf | Should -Match "^\d{8}-\d{6}-commit-$($t.Rows[1].Substring(0, 7))$"
+                    $launchesPick | Should -Be 3
+                    $script:Launches.Count | Should -Be 6
+                    for ($i = 0; $i -lt 3; $i++) {
+                        Get-OdFiles $viaPick[$i].HeadPath | Should -Be (Get-OdFiles $viaCommit[$i].HeadPath)
+                    }
+                }
+
+                It 'Space then Enter on another row opens marked..selected with the OLDER row as the base, as -From (older) -To (newer): one run range-(a7)-(b7), the exact pins (<Name>)' -ForEach @(
+                    @{ Name = 'marked the newer row, Enter on the older'; Keys = 'Space', 'Down', 'Down', 'Enter' }
+                    @{ Name = 'marked the older row, Enter on the newer'; Keys = 'Down', 'Down', 'Space', 'Up', 'Up', 'Enter' }
+                ) {
+                    $t = New-OdPickTree
+                    $map = @{ Space = $script:KSpace; Down = $script:KDown; Up = [System.ConsoleKey]::UpArrow; Enter = $script:KEnter }
+                    Push-OdKeys @($Keys | ForEach-Object { $map[$_] })
+                    # Rows[2] is the commit before the first cascade, Rows[0] the second cascade: both cascades between.
+                    $a = Get-OdPinsAt $t $t.Rows[2]
+                    $b = Get-OdPinsAt $t $t.Rows[0]
+                    $a.Child  | Should -Be $t.OldChild      # precondition: the fixture's own pins
+                    $a.Nested | Should -Be $t.OldNested
+                    $a7 = $t.Rows[2].Substring(0, 7)
+                    $b7 = $t.Rows[0].Substring(0, 7)
+
+                    $r = @(Show-OgDiff -ProjectRoot $t.Project -Pick)
+
+                    ($r | ForEach-Object Path)   | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                    ($r | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened')
+                    @($r[0].BaseRev, $r[0].HeadRev) | Should -Be @($a.Root, $b.Root)
+                    @($r[1].BaseRev, $r[1].HeadRev) | Should -Be @($a.Child, $b.Child)
+                    @($r[2].BaseRev, $r[2].HeadRev) | Should -Be @($a.Nested, $b.Nested)
+                    foreach ($x in $r) {
+                        ($x.PSObject.Properties.Name -join ',') | Should -Be $script:OdResultFields
+                        ($null -eq $x.Commit) | Should -BeTrue -Because 'a range has no one root commit'
+                    }
+                    $runs = @(Get-ChildItem -LiteralPath $script:RunRoot -Directory)
+                    $runs.Count   | Should -Be 1
+                    $runs[0].Name | Should -Match "^\d{8}-\d{6}-range-$a7-$b7$"
+                    $script:Launches.Count | Should -Be 3
+                    for ($i = 0; $i -lt 3; $i++) {
+                        $r[$i].RunPath | Should -Be $runs[0].FullName
+                        $script:Launches[$i] | Should -Be "`"C:\Tools\FakeTool.exe`" `"$($r[$i].BasePath)`" `"$($r[$i].HeadPath)`""
+                        $repoFolder = @('project', 'child', 'nested')[$i]
+                        Split-Path $r[$i].BasePath -Leaf | Should -Be ("$repoFolder base " + $r[$i].BaseRev.Substring(0, 7))
+                        Split-Path $r[$i].HeadPath -Leaf | Should -Be ("$repoFolder head " + $r[$i].HeadRev.Substring(0, 7))
+                    }
+                    Get-OdText (Join-Path $r[2].HeadPath 'README.md') | Should -Be 'second cascade'
+                    Assert-OdLaunchAfterExit
+
+                    $viaCli = @(Show-OgDiff -ProjectRoot $t.Project -From $t.Rows[2] -To $t.Rows[0])
+                    (Format-OdPickComparable $r) | Should -Be (Format-OdPickComparable $viaCli)
+                }
+
+                It 'h opens the SELECTED row to HEAD, as -From (row) -To HEAD: run range-(a7)-(HEAD7), and ignores a mark' {
+                    $t = New-OdPickTree
+                    # A mark on row 2 that h must ignore, then h on row 1.
+                    Push-OdKeys @($script:KDown, $script:KDown, $script:KSpace, [System.ConsoleKey]::UpArrow, 'h')
+                    $a = Get-OdPinsAt $t $t.Rows[1]
+                    $head = Get-OdPinsAt $t $t.Rows[0]
+
+                    $r = @(Show-OgDiff -ProjectRoot $t.Project -Pick)
+
+                    # Rows[1]..HEAD is the second cascade: pins only in the root; the child's later.txt and the nested
+                    # README (the picker's 'child +1').
+                    ($r | ForEach-Object Path)   | Should -Be @('libs/child', 'libs/child/ext/nested')
+                    ($r | ForEach-Object Action) | Should -Be @('opened', 'opened')
+                    @($r[0].BaseRev, $r[0].HeadRev) | Should -Be @($a.Child, $head.Child)
+                    @($r[1].BaseRev, $r[1].HeadRev) | Should -Be @($a.Nested, $head.Nested)
+                    $r | ForEach-Object { ($null -eq $_.Commit) | Should -BeTrue }
+                    Split-Path $r[1].RunPath -Leaf | Should -Match "^\d{8}-\d{6}-range-$($t.Rows[1].Substring(0, 7))-$($t.Rows[0].Substring(0, 7))$"
+                    $script:Launches.Count | Should -Be 2
+                    Assert-OdLaunchAfterExit
+
+                    $viaCli = @(Show-OgDiff -ProjectRoot $t.Project -From $t.Rows[1] -To HEAD)
+                    (Format-OdPickComparable $r) | Should -Be (Format-OdPickComparable $viaCli)
+                }
+
+                It 'w opens the SELECTED row to the working tree, as -From (row) -IncludeWorkingTree: run range-(a7)-working, uncommitted and untracked work included' {
+                    $t = New-OdPickTree
+                    Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'unstaged child'
+                    Set-Content -LiteralPath (Join-Path $t.Nested 'untracked.txt') -Value 'untracked'
+                    Push-OdKeys @($script:KDown, 'w')
+                    $a = Get-OdPinsAt $t $t.Rows[1]
+                    $a7 = $t.Rows[1].Substring(0, 7)
+
+                    $r = @(Show-OgDiff -ProjectRoot $t.Project -Pick)
+
+                    ($r | ForEach-Object Path)    | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                    ($r | ForEach-Object Action)  | Should -Be @('clean', 'opened', 'opened')
+                    ($r | ForEach-Object BaseRev) | Should -Be @($a.Root, $a.Child, $a.Nested)
+                    $r | ForEach-Object {
+                        ($null -eq $_.HeadRev) | Should -BeTrue
+                        ($null -eq $_.Commit)  | Should -BeTrue
+                    }
+                    Split-Path $r[1].HeadPath -Leaf | Should -Be 'child working'
+                    Split-Path $r[1].BasePath -Leaf | Should -Be "child base $($a.Child.Substring(0, 7))"
+                    Get-OdText (Join-Path $r[1].HeadPath 'README.md') | Should -Be 'unstaged child'
+                    Get-OdFiles $r[2].HeadPath | Should -Contain 'untracked.txt'
+                    Split-Path $r[1].RunPath -Leaf | Should -Match "^\d{8}-\d{6}-range-$a7-working$"
+                    $script:Launches.Count | Should -Be 2
+                    Assert-OdLaunchAfterExit
+
+                    $viaCli = @(Show-OgDiff -ProjectRoot $t.Project -From $t.Rows[1] -IncludeWorkingTree)
+                    (Format-OdPickComparable $r) | Should -Be (Format-OdPickComparable $viaCli)
+                }
+
+                It 'h on the top row (HEAD itself) warns that there is nothing between it and HEAD and opens nothing' {
+                    $t = New-OdPickTree
+                    Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'nothing may open for an empty range' }
+                    Push-OdKeys @('h')
+                    $head7 = $t.Rows[0].Substring(0, 7)
+
+                    $r = @(Show-OgDiff -ProjectRoot $t.Project -Pick -WarningVariable warnings -WarningAction SilentlyContinue)
+
+                    $r.Count | Should -Be 0
+                    @($warnings).Count | Should -Be 1
+                    "$($warnings[0])" | Should -Be "Nothing between $head7 and HEAD: both name the same commit, so there is nothing to compare in '$($t.Project)'."
+                    $script:Launches.Count | Should -Be 0
+                    Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+                    Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+                    $script:PickEvents[$script:PickEvents.Count - 1] | Should -Be 'exit'
+                }
+
+                It 'an unknown choice Kind throws naming it and opens nothing, never falling through to the default working-tree diff (od review 11b, N1)' {
+                    # Unreachable today (Get-OgPickerChoice's Kinds are closed), so the picker is replaced: without the
+                    # routing's default throw, $mode would stay 'Pick' and the sweep would run the DEFAULT working-tree
+                    # diff of the whole tree (measured in review 11b), an Open-OgDirDiffSet call this test forbids.
+                    $t = New-OdPickTree
+                    Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'unstaged child'   # a default-mode diff would open it
+                    Mock -ModuleName og-framework Invoke-OgDiffPicker {
+                        [PSCustomObject]@{ PSTypeName = 'Og.PickerChoice'; Kind = 'Bogus'; Commit = $null; From = 'x'; To = $null }
+                    }
+                    Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'nothing may open for an unknown choice' }
+
+                    { Show-OgDiff -ProjectRoot $t.Project -Pick } | Should -Throw "*unknown choice 'Bogus'*"
+
+                    Should -Invoke -ModuleName og-framework Invoke-OgDiffPicker -Times 1 -Exactly
+                    $script:Launches.Count | Should -Be 0
+                    Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+                    Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+                }
+
+                It 'a mark, then Esc, opens nothing' {
+                    $t = New-OdPickTree
+                    Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'nothing may open on cancel' }
+                    Push-OdKeys @($script:KSpace, $script:KDown, $script:KEsc)
+
+                    $r = @(Show-OgDiff -ProjectRoot $t.Project -Pick)
+
+                    $r.Count | Should -Be 0
+                    $script:Launches.Count | Should -Be 0
+                    Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+                    Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+                }
+
+                It '-Pick -PerFile routes per choice: a picked range runs git difftool (pin at A) (pin at B), w runs git difftool (pin at A), never an export' {
+                    $t = New-OdPickTree
+                    Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'unstaged child'
+                    $script:Difftool = [System.Collections.Generic.List[object]]::new()
+                    Mock -ModuleName og-framework Invoke-Git -ParameterFilter { $Arguments -contains 'difftool' } {
+                        $script:Difftool.Add([PSCustomObject]@{ Dir = $WorkingDirectory; Args = @($Arguments) })
+                        $script:PickEvents.Add('difftool')
+                        [PSCustomObject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; WorkingDirectory = $WorkingDirectory }
+                    }
+                    Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'no directory diff under -PerFile' }
+                    $a = Get-OdPinsAt $t $t.Rows[2]
+                    $b = Get-OdPinsAt $t $t.Rows[0]
+                    $w = Get-OdPinsAt $t $t.Rows[1]
+
+                    # Range: mark row 0, Enter on row 2.
+                    Push-OdKeys @($script:KSpace, $script:KDown, $script:KDown, $script:KEnter)
+                    $range = @(Show-OgDiff -ProjectRoot $t.Project -Pick -PerFile)
+                    ($range | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened')
+                    @($script:Difftool | ForEach-Object Dir) | Should -Be @($t.Project, $t.Child, $t.Nested)
+                    $script:Difftool[0].Args | Should -Be @('difftool', '--no-prompt', $a.Root, $b.Root)
+                    $script:Difftool[1].Args | Should -Be @('difftool', '--no-prompt', $a.Child, $b.Child)
+                    $script:Difftool[2].Args | Should -Be @('difftool', '--no-prompt', $a.Nested, $b.Nested)
+                    $range | ForEach-Object { ($null -eq $_.Commit) | Should -BeTrue; $_.RunPath | Should -BeNullOrEmpty }
+                    $script:PickEvents.IndexOf('difftool') | Should -BeGreaterThan $script:PickEvents.IndexOf('exit')
+
+                    # w on row 1: one argument, each repo's pin at row 1 (tracked files only, as git difftool).
+                    $script:Difftool.Clear()
+                    $script:PickEvents.Clear()
+                    Push-OdKeys @($script:KDown, 'w')
+                    $working = @(Show-OgDiff -ProjectRoot $t.Project -Pick -PerFile)
+                    $pinByDir = @{ $t.Project = $w.Root; $t.Child = $w.Child; $t.Nested = $w.Nested }
+                    @($script:Difftool | ForEach-Object Dir) | Should -Contain $t.Child
+                    @($script:Difftool | ForEach-Object Dir) | Should -Contain $t.Nested
+                    foreach ($call in $script:Difftool) {
+                        $call.Args | Should -Be @('difftool', '--no-prompt', $pinByDir[$call.Dir])
+                    }
+                    ($working | ForEach-Object Path)    | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                    ($working | ForEach-Object BaseRev) | Should -Be @($w.Root, $w.Child, $w.Nested)
+                    $script:PickEvents.IndexOf('difftool') | Should -BeGreaterThan $script:PickEvents.IndexOf('exit')
+                    Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+                    Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+                }
+            }
+        }
+
+        Context 'od task 10: -From A [-To B] [-IncludeWorkingTree] diffs a range between root commits, or a root commit against the working tree' {
+
+            BeforeAll {
+                # Two cascades on the 4b tree: A = the root before the first, M = after it, B = after the second.
+                # Child and nested move ON past their pins at B (unpinned commits), so a diff that used a tip
+                # instead of a pin would show other sides.
+                function New-OdTwoCascades {
+                    Copy-TestFixture -Key 'od-two-cascades' -Builder {
+                        $t = New-OdCascade               # A = OldRoot, M = Sha (child/nested tips already past M)
+                        $t.A = $t.OldRoot
+                        $t.M = $t.Sha
+                        Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'second cascade'
+                        Set-Content -LiteralPath (Join-Path $t.Project 'second.txt') -Value 'second root'
+                        Add-OgChange -ProjectRoot $t.Project | Out-Null
+                        New-OgCommit -Message 'second' -ProjectRoot $t.Project | Out-Null
+                        $t.B       = Get-OdRev $t.Project
+                        $t.ChildB  = Get-OdRev $t.Project 'HEAD:libs/child'
+                        $t.NestedB = Get-OdRev $t.Child 'HEAD:ext/nested'
+                        Add-TestCommit -Dir $t.Nested -File 'after-b.txt' -Message 'after B nested'
+                        Add-TestCommit -Dir $t.Child  -File 'after-b.txt' -Message 'after B child'
+                        Get-OdRev $t.Nested | Should -Not -Be $t.NestedB   # precondition: the tips moved on
+                        Get-OdRev $t.Child  | Should -Not -Be $t.ChildB
+                        $t
+                    }
+                }
+
+                # One line per result: every field, with BasePath/HeadPath relative to the run folder (two runs never
+                # share a folder); Commit and RunPath left out, the only fields a range and -Commit differ in.
+                function Format-OdComparable {
+                    param([object[]] $Results)
+                    foreach ($x in $Results) {
+                        $rel = { param($p) if ($p) { $p.Substring($x.RunPath.Length) } else { '<null>' } }
+                        (@('Repo', 'Path', 'Action', 'Error', 'Ref', 'Range', 'BaseRev', 'HeadRev', 'FileCount' | ForEach-Object {
+                            "$_=$(if ($null -eq $x.$_) { '<null>' } else { $x.$_ })" }) +
+                         "BasePath=$(& $rel $x.BasePath)" + "HeadPath=$(& $rel $x.HeadPath)") -join '|'
+                    }
+                }
+
+                # The equivalence fixtures (4b's cases): each returns @{ T = the tree; X = the root commit to diff }.
+                $script:OdEquivFixture = @{
+                    'cascade'        = { $t = New-OdCascade; @{ T = $t; X = $t.Sha } }
+                    'pins-only'      = {
+                        Copy-TestFixture -Key 'od-equiv-pins-only' -Builder {
+                            $t = New-OdCommitTree
+                            Set-Content -LiteralPath (Join-Path $t.Nested 'README.md') -Value 'nested only'
+                            Add-OgChange -ProjectRoot $t.Project | Out-Null
+                            New-OgCommit -Message 'nested only' -ProjectRoot $t.Project | Out-Null
+                            @{ T = $t; X = (Get-OdRev $t.Project) }
+                        }
+                    }
+                    'added'          = { $t = New-OdCommitTree; @{ T = $t; X = (Get-OdRev $t.Project) } }
+                    'removed'        = {
+                        Copy-TestFixture -Key 'od-equiv-removed' -Builder {
+                            $t = New-OdCommitTree
+                            Invoke-TestGit $t.Project rm -q -- libs/child | Out-Null
+                            Invoke-TestGit $t.Project commit -q -m 'drop child' | Out-Null
+                            @{ T = $t; X = (Get-OdRev $t.Project) }
+                        }
+                    }
+                    'missing-commit' = {
+                        Copy-TestFixture -Key 'od-equiv-missing-commit' -Builder {
+                            # A real child commit that exists only in another clone (never fetched here).
+                            $t = New-OdCommitTree
+                            $other = Join-Path $t.Root 'other-child'
+                            Invoke-TestGit $t.Root clone -q $t.ChildUrl $other | Out-Null
+                            Add-TestCommit -Dir $other -File 'remote-only.txt' -Message 'remote only'
+                            Set-Content -LiteralPath (Join-Path $t.Project 'root.txt') -Value 'root work'
+                            Invoke-TestGit $t.Project add -- root.txt | Out-Null
+                            Invoke-TestGit $t.Project update-index --cacheinfo "160000,$(Get-OdRev $other),libs/child" | Out-Null
+                            Invoke-TestGit $t.Project commit -q -m 'pin to a commit not fetched' | Out-Null
+                            @{ T = $t; X = (Get-OdRev $t.Project); Missing = (Get-OdRev $other) }
+                        }
+                    }
+                }
+            }
+
+            It '-From A -To B opens ONE run folder range-(a7)-(b7) with the exact pin pairs across two cascades, never a tip' {
+                $t = New-OdTwoCascades
+                $a7 = $t.A.Substring(0, 7)
+                $b7 = $t.B.Substring(0, 7)
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a7 -To $t.B)
+
+                ($r | ForEach-Object Path)   | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($r | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened')
+                @($r[0].BaseRev, $r[0].HeadRev) | Should -Be @($t.A, $t.B)
+                @($r[1].BaseRev, $r[1].HeadRev) | Should -Be @($t.OldChild, $t.ChildB)
+                @($r[2].BaseRev, $r[2].HeadRev) | Should -Be @($t.OldNested, $t.NestedB)
+                foreach ($x in $r) {
+                    ($x.PSObject.Properties.Name -join ',') | Should -Be $script:OdResultFields
+                    $x.Commit | Should -BeNullOrEmpty
+                    $x.Ref    | Should -BeNullOrEmpty
+                    $x.Range  | Should -BeNullOrEmpty
+                }
+
+                $runs = @(Get-ChildItem -LiteralPath $script:RunRoot -Directory)
+                $runs.Count   | Should -Be 1
+                $runs[0].Name | Should -Match "^\d{8}-\d{6}-range-$a7-$b7$"
+                $r | ForEach-Object { $_.RunPath | Should -Be $runs[0].FullName }
+                $script:Launches.Count | Should -Be 3
+                for ($i = 0; $i -lt 3; $i++) {
+                    $script:Launches[$i] | Should -Be "`"C:\Tools\FakeTool.exe`" `"$($r[$i].BasePath)`" `"$($r[$i].HeadPath)`""
+                    $repoFolder = @('project', 'child', 'nested')[$i]
+                    Split-Path $r[$i].BasePath -Leaf | Should -Be ("$repoFolder base " + $r[$i].BaseRev.Substring(0, 7))
+                    Split-Path $r[$i].HeadPath -Leaf | Should -Be ("$repoFolder head " + $r[$i].HeadRev.Substring(0, 7))
+                }
+
+                # Both cascades' changes, from the pins: nested at B has manual.txt, later.txt (picked up by the second
+                # cascade) and the second README, never after-b.txt (its tip). Sort-Object's culture order.
+                Get-OdFiles $r[0].HeadPath | Should -Be @('README.md', 'root.txt', 'second.txt')
+                Get-OdFiles $r[1].HeadPath | Should -Be @('child.txt', 'later.txt', 'README.md')
+                Get-OdFiles $r[2].BasePath | Should -Be @('README.md')
+                Get-OdFiles $r[2].HeadPath | Should -Be @('later.txt', 'manual.txt', 'README.md')
+                Get-OdText (Join-Path $r[2].BasePath 'README.md') | Should -Be '# nested'
+                Get-OdText (Join-Path $r[2].HeadPath 'README.md') | Should -Be 'second cascade'
+            }
+
+            It '-From A alone is A..HEAD: the same results as -To HEAD, labelled with HEAD''s short sha' {
+                $t = New-OdTwoCascades
+                $head7 = (Get-OdRev $t.Project).Substring(0, 7)
+
+                $viaDefault = @(Show-OgDiff -ProjectRoot $t.Project -From $t.M)
+                $viaHead    = @(Show-OgDiff -ProjectRoot $t.Project -From $t.M -To HEAD)
+
+                ($viaDefault | ForEach-Object Path) | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                @($viaDefault[1].BaseRev, $viaDefault[1].HeadRev) | Should -Be @($t.NewChild, $t.ChildB)
+                (Format-OdComparable $viaDefault) | Should -Be (Format-OdComparable $viaHead)
+                Split-Path $viaDefault[0].RunPath -Leaf | Should -Match "-range-$($t.M.Substring(0, 7))-$head7$"
+            }
+
+            It 'two ends naming the same commit warn once with the short sha of each end, HEAD only for a literal -To HEAD, and open nothing (od review 11b, N3)' {
+                # One fixture, six spellings of the same two ends (a fixture costs seconds, a call does not).
+                $t = New-OdCascade
+                $head  = Get-OdRev $t.Project
+                $head7 = $head.Substring(0, 7)
+                Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'nothing may open for an empty range' }
+                $cases = @(
+                    @{ Name = 'full shas both ends';   From = $head;  To = $head;  Shown = $head7 }
+                    @{ Name = 'short -From, full -To'; From = $head7; To = $head;  Shown = $head7 }
+                    @{ Name = '-To HEAD';              From = $head;  To = 'HEAD'; Shown = 'HEAD' }
+                    @{ Name = '-To left out (HEAD)';   From = $head7; To = $null;  Shown = 'HEAD' }
+                    @{ Name = '-From HEAD, full -To';  From = 'HEAD'; To = $head;  Shown = $head7 }
+                    # A SHORT -To that is not HEAD (review 12, item 2): pins "HEAD only for the literal HEAD", not "HEAD for
+                    # anything shorter than a full sha".
+                    @{ Name = 'short shas both ends';  From = $head7; To = $head7; Shown = $head7 }
+                )
+
+                foreach ($case in $cases) {
+                    $rangeArgs = @{ ProjectRoot = $t.Project; From = $case.From }
+                    if ($case.To) { $rangeArgs.To = $case.To }
+                    $r = @(Show-OgDiff @rangeArgs -WarningVariable warnings -WarningAction SilentlyContinue)
+
+                    $r.Count | Should -Be 0 -Because $case.Name
+                    @($warnings).Count | Should -Be 1 -Because $case.Name
+                    "$($warnings[0])" | Should -BeExactly ("Nothing between $head7 and $($case.Shown): both name the same commit, " +
+                        "so there is nothing to compare in '$($t.Project)'.") -Because $case.Name
+                }
+                $script:Launches.Count | Should -Be 0
+                Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+            }
+
+            It '-From X^1 -To X gives the results of -Commit X, field by field (<Name>)' -ForEach @(
+                @{ Name = 'cascade' }, @{ Name = 'pins-only' }, @{ Name = 'added' }, @{ Name = 'removed' }, @{ Name = 'missing-commit' }
+            ) {
+                $f = & $script:OdEquivFixture[$Name]
+
+                $viaCommit = @(Show-OgDiff -ProjectRoot $f.T.Project -Commit $f.X -WarningAction SilentlyContinue)
+                $launchesCommit = $script:Launches.Count
+                $viaRange  = @(Show-OgDiff -ProjectRoot $f.T.Project -From "$($f.X)^1" -To $f.X -WarningAction SilentlyContinue)
+
+                $viaCommit.Count | Should -BeGreaterThan 0
+                (Format-OdComparable $viaRange) | Should -Be (Format-OdComparable $viaCommit)
+                $viaCommit | ForEach-Object { $_.Commit | Should -Be $f.X }
+                # $null, not '': New-OgDirDiffRequest stores a bound -Commit as given (review 10 note 2).
+                $viaRange  | ForEach-Object { ($null -eq $_.Commit) | Should -BeTrue -Because 'a range result carries no Commit' }
+                $script:Launches.Count | Should -Be (2 * $launchesCommit)
+                # The same files on the same sides.
+                for ($i = 0; $i -lt $viaCommit.Count; $i++) {
+                    if ($viaCommit[$i].BasePath) {
+                        Get-OdFiles $viaRange[$i].BasePath | Should -Be (Get-OdFiles $viaCommit[$i].BasePath)
+                        Get-OdFiles $viaRange[$i].HeadPath | Should -Be (Get-OdFiles $viaCommit[$i].HeadPath)
+                    }
+                }
+                # Not vacuous: each fixture shows its own case.
+                switch ($Name) {
+                    'cascade'        { ($viaRange | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened') }
+                    'pins-only'      { ($viaRange | ForEach-Object Action) | Should -Be @('clean', 'opened') }
+                    'added'          { $viaRange[1].BaseRev | Should -BeNullOrEmpty }
+                    'removed'        { ($viaRange | ForEach-Object HeadRev) | Should -Be @($f.X, $null, $null) }
+                    'missing-commit' {
+                        ($viaRange | ForEach-Object Action) | Should -Be @('opened', 'missing-commit')
+                        $viaRange[1].Error | Should -Match "head pin $($f.Missing)"
+                    }
+                }
+            }
+
+            It '-From A -IncludeWorkingTree: each repo from its pin at A to its working tree (committed, staged, unstaged, untracked); a repo absent at A from an empty base; read-only' {
+                $t = New-OdCommitTree
+                $a        = Get-OdRev $t.Project 'HEAD~1'             # before nested was added: nested is absent at A
+                $childAtA = Get-OdRev $t.Project 'HEAD~1:libs/child'
+                # Committed since A (a cascade), then uncommitted work: staged, unstaged and untracked.
+                Set-Content -LiteralPath (Join-Path $t.Child 'child.txt') -Value 'committed'
+                Add-OgChange -ProjectRoot $t.Project | Out-Null
+                New-OgCommit -Message 'since A' -ProjectRoot $t.Project | Out-Null
+                Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'staged'
+                Invoke-TestGit $t.Child add -- README.md | Out-Null
+                Set-Content -LiteralPath (Join-Path $t.Project 'README.md') -Value 'unstaged'
+                Set-Content -LiteralPath (Join-Path $t.Nested 'untracked.txt') -Value 'untracked'
+                $before = Get-OdTreeSnapshot $t.Root
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree)
+
+                ($r | ForEach-Object Path)      | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($r | ForEach-Object Action)    | Should -Be @('opened', 'opened', 'opened')
+                ($r | ForEach-Object BaseRev)   | Should -Be @($a, $childAtA, $null)
+                ($r | ForEach-Object FileCount) | Should -Be @(1, 3, 2)
+                foreach ($x in $r) {
+                    $x.HeadRev | Should -BeNullOrEmpty
+                    $x.Commit  | Should -BeNullOrEmpty
+                }
+
+                $runs = @(Get-ChildItem -LiteralPath $script:RunRoot -Directory)
+                $runs.Count   | Should -Be 1
+                $runs[0].Name | Should -Match "^\d{8}-\d{6}-range-$($a.Substring(0, 7))-working$"
+                Split-Path $r[0].BasePath -Leaf | Should -Be "project base $($a.Substring(0, 7))"
+                Split-Path $r[0].HeadPath -Leaf | Should -Be 'project working'
+                Get-OdText (Join-Path $r[0].BasePath 'README.md') | Should -Be '# parent'
+                Get-OdText (Join-Path $r[0].HeadPath 'README.md') | Should -Be 'unstaged'
+
+                # The child: its pin at A on the left; the commit since A, the staged edit and its new .gitmodules on
+                # the right.
+                Get-OdFiles $r[1].BasePath | Should -Be @('README.md')
+                Get-OdFiles $r[1].HeadPath | Should -Be @('.gitmodules', 'child.txt', 'README.md')
+                Get-OdText (Join-Path $r[1].HeadPath 'README.md') | Should -Be 'staged'
+                Get-OdText (Join-Path $r[1].HeadPath 'child.txt') | Should -Be 'committed'
+
+                # Nested is absent at A: an EMPTY base, every file of its working tree Added, the untracked one too.
+                Split-Path $r[2].BasePath -Leaf | Should -Be 'nested base empty'
+                Get-OdFiles $r[2].BasePath | Should -Be @()
+                Get-OdFiles $r[2].HeadPath | Should -Be @('README.md', 'untracked.txt')
+                $script:Launches.Count | Should -Be 3
+
+                Get-OdTreeSnapshot $t.Root | Should -Be $before
+            }
+
+            It '-From A -IncludeWorkingTree lists every repo of the tree: nothing since A is clean, uncommitted work alone opens' {
+                $t = New-OdCommitTree
+                $a = Get-OdRev $t.Project
+                Set-Content -LiteralPath (Join-Path $t.Nested 'only-on-disk.txt') -Value 'untracked'
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree)
+
+                ($r | ForEach-Object Path)      | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($r | ForEach-Object Action)    | Should -Be @('clean', 'clean', 'opened')
+                ($r | ForEach-Object FileCount) | Should -Be @(0, 0, 1)
+                $r[2].BaseRev | Should -Be (Get-OdRev $t.Child 'HEAD:ext/nested')
+                $script:Launches.Count | Should -Be 1
+            }
+
+            It '-From A -IncludeWorkingTree: a repo A pins that the tree no longer has is diffed through its kept git dir to an empty head, read-only' {
+                $t = New-OdCommitTree
+                $a         = Get-OdRev $t.Project
+                $oldChild  = Get-OdRev $t.Project 'HEAD:libs/child'
+                $oldNested = Get-OdRev $t.Child 'HEAD:ext/nested'
+                Invoke-TestGit $t.Project rm -q -- libs/child | Out-Null
+                Invoke-TestGit $t.Project commit -q -m 'drop child' | Out-Null
+                $before = Get-OdTreeSnapshot $t.Root
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree)
+
+                ($r | ForEach-Object Path)   | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($r | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened')
+                @($r[1].BaseRev, $r[1].HeadRev) | Should -Be @($oldChild, $null)
+                @($r[2].BaseRev, $r[2].HeadRev) | Should -Be @($oldNested, $null)
+                Split-Path $r[0].HeadPath -Leaf | Should -Be 'project working'
+                Get-OdFiles $r[0].BasePath | Should -Be @('.gitmodules')
+                Split-Path $r[1].HeadPath -Leaf | Should -Be 'child head empty'
+                Get-OdFiles $r[1].BasePath | Should -Be @('.gitmodules', 'README.md')
+                Get-OdFiles $r[1].HeadPath | Should -Be @()
+                Get-OdFiles $r[2].BasePath | Should -Be @('README.md')
+                Get-OdTreeSnapshot $t.Root | Should -Be $before
+                Test-Path -LiteralPath $t.Child | Should -BeFalse
+            }
+
+            It '-From A -IncludeWorkingTree: a pin missing at A is missing-commit, and so is a repo below it (unknown at A), in tree order' {
+                $f = & $script:OdEquivFixture['missing-commit']
+                $t = $f.T
+                $zedUrl = New-TestRemote -Root $t.Remotes -Name 'zed'
+                Add-OgSubmodule -Url $zedUrl -Path 'libs/zed' -ProjectRoot $t.Project | Out-Null
+                Invoke-TestGit $t.Project add -- .gitmodules libs/zed | Out-Null
+                Invoke-TestGit $t.Project commit -q -m 'add zed' | Out-Null
+                $a = Get-OdRev $t.Project          # pins the child to the missing commit; zed is present
+                Set-Content -LiteralPath (Join-Path $t.Project 'libs\zed\z.txt') -Value 'zed work'
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree -WarningVariable warnings -WarningAction SilentlyContinue)
+
+                ($r | ForEach-Object Path)   | Should -Be @('', 'libs/child', 'libs/child/ext/nested', 'libs/zed')
+                ($r | ForEach-Object Action) | Should -Be @('clean', 'missing-commit', 'missing-commit', 'opened')
+                $r[1].Error   | Should -Match "pin $($f.Missing)"
+                $r[1].BaseRev | Should -Be $f.Missing
+                $r[2].Error   | Should -Match 'unknown'
+                $r[2].Error   | Should -Match "'libs/child' is missing-commit"
+                $r[2].BaseRev | Should -BeNullOrEmpty
+                foreach ($x in $r[1], $r[2]) {
+                    ($x.PSObject.Properties.Name -join ',') | Should -Be $script:OdResultFields
+                    $x.FileCount | Should -BeNullOrEmpty
+                    $x.RunPath   | Should -BeNullOrEmpty
+                }
+                @($warnings | Where-Object { "$_" -match 'missing-commit' }).Count | Should -Be 2
+                $script:Launches.Count | Should -Be 1
+                Get-OdFiles $r[3].HeadPath | Should -Be @('z.txt')
+            }
+
+            It '-From A -IncludeWorkingTree skips a repo that is not checked out (deinit-ed) and the repos A pins below it, never reporting them removed' {
+                $t = New-OdCommitTree
+                $a = Get-OdRev $t.Project
+                Invoke-TestGit $t.Project submodule deinit -q -f -- libs/child | Out-Null
+                @(Get-ChildItem -LiteralPath $t.Child -Force).Count | Should -Be 0                      # precondition: an empty folder
+                Test-Path -LiteralPath (Join-Path $t.GitDir 'modules\child-module') | Should -BeTrue   # its git dir kept
+                Set-Content -LiteralPath (Join-Path $t.Project 'root.txt') -Value 'root work'
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree -WarningVariable warnings -WarningAction SilentlyContinue)
+
+                ($r | ForEach-Object Path)   | Should -Be @('')
+                ($r | ForEach-Object Action) | Should -Be @('opened')
+                Get-OdFiles $r[0].HeadPath | Should -Be @('root.txt')
+                @($warnings).Count | Should -Be 0
+                $script:Launches.Count | Should -Be 1
+            }
+
+            It 'keeps tree order with sibling repos libs/child and libs/child-x and the nested libs/child/ext/nested, in both forms' {
+                $t = New-OdCommitTree
+                $xUrl = New-TestRemote -Root $t.Remotes -Name 'child-x'
+                Add-OgSubmodule -Url $xUrl -Path 'libs/child-x' -ProjectRoot $t.Project | Out-Null
+                Add-OgChange -ProjectRoot $t.Project | Out-Null
+                New-OgCommit -Message 'add child-x' -ProjectRoot $t.Project | Out-Null
+                $a = Get-OdRev $t.Project
+                $childX = Join-Path $t.Project 'libs\child-x'
+                foreach ($dir in $t.Project, $t.Child, $t.Nested, $childX) {
+                    Set-Content -LiteralPath (Join-Path $dir 'README.md') -Value "changed in $(Split-Path $dir -Leaf)"
+                }
+                Add-OgChange -ProjectRoot $t.Project | Out-Null
+                New-OgCommit -Message 'all four' -ProjectRoot $t.Project | Out-Null
+                Set-Content -LiteralPath (Join-Path $childX 'new.txt') -Value 'untracked'
+                # Depth-first: the nested repo before the sibling, although '/' sorts after '-' in a flat path order.
+                $expected = @('', 'libs/child', 'libs/child/ext/nested', 'libs/child-x')
+
+                $range = @(Show-OgDiff -ProjectRoot $t.Project -From $a -To HEAD)
+                ($range | ForEach-Object Path)   | Should -Be $expected
+                ($range | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened', 'opened')
+
+                $working = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree)
+                ($working | ForEach-Object Path)      | Should -Be $expected
+                ($working | ForEach-Object FileCount) | Should -Be @(1, 1, 1, 2)
+                $script:Launches.Count | Should -Be 8
+            }
+
+            It '-PerFile runs git difftool (pin at A) (pin at B) per repo, or (pin at A) against the working tree; one-sided repos fail with the directory-mode hint' {
+                $t = New-OdCommitTree
+                $a        = Get-OdRev $t.Project 'HEAD~1'             # nested absent at A
+                $childAtA = Get-OdRev $t.Project 'HEAD~1:libs/child'
+                $b        = Get-OdRev $t.Project
+                $childAtB = Get-OdRev $t.Project 'HEAD:libs/child'
+                Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'unstaged child'
+                $script:Difftool = [System.Collections.Generic.List[object]]::new()
+                Mock -ModuleName og-framework Invoke-Git -ParameterFilter { $Arguments -contains 'difftool' } {
+                    $script:Difftool.Add([PSCustomObject]@{ Dir = $WorkingDirectory; Args = @($Arguments) })
+                    [PSCustomObject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; WorkingDirectory = $WorkingDirectory }
+                }
+                Mock -ModuleName og-framework Open-OgDirDiffSet { throw 'no directory diff under -PerFile' }
+
+                # Range: no root file changed between A and B (only the child's pin); the child moved; nested was added.
+                $range = @(Show-OgDiff -ProjectRoot $t.Project -From $a -To $b -PerFile -WarningAction SilentlyContinue)
+                ($range | ForEach-Object Path)   | Should -Be @('libs/child', 'libs/child/ext/nested')
+                ($range | ForEach-Object Action) | Should -Be @('opened', 'failed')
+                $range[1].Error | Should -Match "$($a.Substring(0, 7)) does not contain it"
+                $range[1].Error | Should -Match ([regex]::Escape("oggitdiff -From $($a.Substring(0, 7)) -To $($b.Substring(0, 7))"))
+                $script:Difftool.Count   | Should -Be 1
+                $script:Difftool[0].Dir  | Should -Be $t.Child
+                $script:Difftool[0].Args | Should -Be @('difftool', '--no-prompt', $childAtA, $childAtB)
+                $oracle = @((Invoke-TestGit $t.Child diff --name-only $childAtA $childAtB) -split "`r?`n" | Where-Object { $_ })
+                $range[0].FileCount | Should -Be $oracle.Count
+
+                # Against the working tree: one argument, the pin at A; tracked files only, as git difftool.
+                $script:Difftool.Clear()
+                $working = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree -PerFile -WarningAction SilentlyContinue)
+                ($working | ForEach-Object Path)   | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($working | ForEach-Object Action) | Should -Be @('opened', 'opened', 'failed')
+                $working[2].Error | Should -Match ([regex]::Escape("oggitdiff -From $($a.Substring(0, 7)) -IncludeWorkingTree"))
+                @($script:Difftool | ForEach-Object Dir) | Should -Be @($t.Project, $t.Child)
+                $script:Difftool[0].Args | Should -Be @('difftool', '--no-prompt', $a)
+                $script:Difftool[1].Args | Should -Be @('difftool', '--no-prompt', $childAtA)
+                foreach ($i in 0, 1) {
+                    $dir    = $script:Difftool[$i].Dir
+                    $oracle = @((Invoke-TestGit $dir diff --name-only $script:Difftool[$i].Args[2]) -split "`r?`n" | Where-Object { $_ })
+                    $working[$i].FileCount | Should -Be $oracle.Count
+                    $working[$i].BaseRev   | Should -Be $script:Difftool[$i].Args[2]
+                    $working[$i].HeadRev   | Should -BeNullOrEmpty
+                }
+                Should -Invoke -ModuleName og-framework Open-OgDirDiffSet -Times 0
+                Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+            }
+
+            It 'plain oggitdiff still compares against HEAD: its WorkingTree requests carry no base, so the file counts are unchanged' {
+                $t = New-OdCascade
+                Set-Content -LiteralPath (Join-Path $t.Child 'README.md') -Value 'one edit'
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project)
+
+                ($r | ForEach-Object Path)      | Should -Be @('', 'libs/child', 'libs/child/ext/nested')
+                ($r | ForEach-Object Action)    | Should -Be @('clean', 'opened', 'clean')
+                ($r | ForEach-Object FileCount) | Should -Be @(0, 1, 0)
+                $r[1].BaseRev | Should -Be (Get-OdRev $t.Child)
+                Get-OdFiles $r[1].BasePath | Should -Be @('README.md')
+                Split-Path $r[1].HeadPath -Leaf | Should -Be 'child working'
+            }
+
+            It 'refuses a -From or -To that names no commit or looks like an option before listing anything; binding errors for the other modes' {
+                $t = New-OdCommitTree
+                { Show-OgDiff -ProjectRoot $t.Project -From 'no-such-rev' } | Should -Throw "*'no-such-rev' (-From) does not name a commit*"
+                { Show-OgDiff -ProjectRoot $t.Project -From HEAD -To 'no-such-rev' } | Should -Throw "*'no-such-rev' (-To) does not name a commit*"
+                { Show-OgDiff -ProjectRoot $t.Project -From '--all' } | Should -Throw "*invalid revision '--all' (-From)*"
+                { Show-OgDiff -ProjectRoot $t.Project -From HEAD -To '-p' } | Should -Throw "*invalid revision '-p' (-To)*"
+                { Show-OgDiff -ProjectRoot $t.Project -From 'no-such-rev' -IncludeWorkingTree } | Should -Throw "*'no-such-rev' does not name a commit*"
+                { Show-OgDiff -ProjectRoot $t.Project -From '--output=x' -IncludeWorkingTree } | Should -Throw "*invalid revision '--output=x'*"
+                { Show-OgDiff -ProjectRoot $t.Project -From '' } | Should -Throw
+                { Show-OgDiff -ProjectRoot $t.Project -From HEAD -To '' } | Should -Throw
+                { Show-OgDiff -ProjectRoot $t.Project -From HEAD~1 -To HEAD -IncludeWorkingTree } |
+                    Should -Throw -ExceptionType ([System.Management.Automation.ParameterBindingException])
+                foreach ($other in @{ Commit = 'HEAD' }, @{ Staged = $true }, @{ Against = 'main' }, @{ Pick = $true }, @{ Fetch = $true }, @{ Count = 5 }) {
+                    { Show-OgDiff -ProjectRoot $t.Project -From HEAD~1 @other } |
+                        Should -Throw -ExceptionType ([System.Management.Automation.ParameterBindingException]) -Because "-From with -$($other.Keys)"
+                }
+                $script:Launches.Count | Should -Be 0
+                Test-Path -LiteralPath $script:RunRoot | Should -BeFalse
+                Test-Path -LiteralPath (Join-Path $t.Project 'x') | Should -BeFalse
+            }
+        }
+
+        Context 'od task 11b: an uninitialised or deinit-ed submodule is skipped in every mode, never diffed as its parent' {
+
+            BeforeAll {
+                # Review 10's REV1 fixture: the nested submodule deinit-ed INSIDE the child (an empty folder, its git
+                # dir kept under the child's modules/), plus a staged and a further unstaged edit of README.md in the
+                # root and the child, so the default mode, -Staged and -PerFile all see a change there.
+                function New-OdUninitTree {
+                    Copy-TestFixture -Key 'od-uninit' -Builder {
+                        $t = New-OdCommitTree
+                        Invoke-TestGit $t.Child submodule deinit -q -f -- ext/nested | Out-Null
+                        foreach ($dir in $t.Project, $t.Child) {
+                            Set-Content -LiteralPath (Join-Path $dir 'README.md') -Value 'staged'
+                            Invoke-TestGit $dir add -- README.md | Out-Null
+                            Set-Content -LiteralPath (Join-Path $dir 'README.md') -Value 'staged, then unstaged'
+                        }
+                        @(Get-ChildItem -LiteralPath $t.Nested -Force).Count | Should -Be 0   # precondition: an empty folder
+                        # Precondition, the defect itself: git in the empty folder reaches the CHILD.
+                        (Invoke-TestGit $t.Nested rev-parse --show-toplevel).Replace('/', '\') | Should -Be $t.Child
+                        $t
+                    }
+                }
+            }
+
+            It '<Name>: results for the root and the child only, a verbose skip for the nested folder, nothing listed or launched there' -ForEach @(
+                @{ Name = 'default';  Extra = @{} }
+                @{ Name = '-Staged';  Extra = @{ Staged = $true } }
+                @{ Name = '-Against'; Extra = @{ Against = 'HEAD~1' } }
+                @{ Name = '-PerFile'; Extra = @{ PerFile = $true } }
+            ) {
+                $t = New-OdUninitTree
+                $script:Difftool = [System.Collections.Generic.List[object]]::new()
+                Mock -ModuleName og-framework Invoke-Git -ParameterFilter { $Arguments -contains 'difftool' } {
+                    $script:Difftool.Add([PSCustomObject]@{ Dir = $WorkingDirectory; Args = @($Arguments) })
+                    [PSCustomObject]@{ ExitCode = 0; StdOut = ''; StdErr = ''; WorkingDirectory = $WorkingDirectory }
+                }
+                $script:Requests = [System.Collections.Generic.List[object]]::new()
+                $script:RealOpenSet = InModuleScope og-framework { ${function:Open-OgDirDiffSet} }
+                Mock -ModuleName og-framework Open-OgDirDiffSet {
+                    foreach ($q in $Request) { $script:Requests.Add($q) }
+                    & $script:RealOpenSet -Request $Request -Label $Label -Tool $Tool
+                }
+
+                $out = @(Show-OgDiff -ProjectRoot $t.Project @Extra -Verbose -WarningVariable warnings -WarningAction SilentlyContinue 4>&1)
+                $r       = @($out | Where-Object { $_ -isnot [System.Management.Automation.VerboseRecord] })
+                $verbose = @($out | Where-Object { $_ -is [System.Management.Automation.VerboseRecord] } | ForEach-Object Message)
+
+                ($r | ForEach-Object Path) | Should -Be @('', 'libs/child')
+                @($verbose | Where-Object { $_ -eq "Skipped 'libs/child/ext/nested': it is in the og tree but not checked out here (no work tree of its own)." }).Count |
+                    Should -Be 1
+                @($warnings).Count | Should -Be 0
+                @($script:Requests | Where-Object { $_.WorkingDirectory -eq $t.Nested }).Count | Should -Be 0
+                @($script:Difftool | Where-Object { $_.Dir -eq $t.Nested }).Count | Should -Be 0
+                if ($Name -eq '-PerFile') {
+                    @($script:Difftool | ForEach-Object Dir) | Should -Be @($t.Project, $t.Child)
+                    $script:Launches.Count | Should -Be 0
+                } else {
+                    $script:Difftool.Count | Should -Be 0
+                    # Exactly one launch per opened repo, the nested one never among them.
+                    $script:Launches.Count | Should -Be @($r | Where-Object Action -eq 'opened').Count
+                    $script:Launches | ForEach-Object { $_ | Should -Not -BeLike '*nested*' }
+                }
+                @(Get-ChildItem -LiteralPath $t.Nested -Force).Count | Should -Be 0
+            }
+
+            It '-From A -IncludeWorkingTree: a submodule ABSENT at A and not checked out now is skipped, never diffed as its parent (review 10 note 1)' {
+                $t = New-OdCommitTree
+                $a = Get-OdRev $t.Project 'HEAD~1'             # before nested was added: nested is absent at A
+                Invoke-TestGit $t.Child submodule deinit -q -f -- ext/nested | Out-Null
+                @(Get-ChildItem -LiteralPath $t.Nested -Force).Count | Should -Be 0   # precondition: an empty folder
+
+                $r = @(Show-OgDiff -ProjectRoot $t.Project -From $a -IncludeWorkingTree -WarningVariable warnings -WarningAction SilentlyContinue)
+
+                ($r | ForEach-Object Path) | Should -Be @('', 'libs/child')
+                @($warnings).Count | Should -Be 0
+                $script:Launches | ForEach-Object { $_ | Should -Not -BeLike '*nested*' }
             }
         }
     }

@@ -463,7 +463,11 @@ Describe 'Get-OgDiffChange: the listing without an export' {
     It 'rejects a Range without both revs, revs on another kind, and a rev that does not resolve' {
         $repo = New-TestSidesRepo
         { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'Range'; BaseRev = 'HEAD' } } | Should -Throw '*both -BaseRev and -HeadRev*'
-        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'HEAD' } } | Should -Throw '*belong to -Kind Range*'
+        # od task 9: WorkingTree now takes -BaseRev (tested below), so the "revs on another kind" probes are
+        # Staged with either rev and WorkingTree with -HeadRev.
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'Staged'; BaseRev = 'HEAD' } } | Should -Throw '*belong to -Kind Range*'
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'Staged'; HeadRev = 'HEAD' } } | Should -Throw '*belong to -Kind Range*'
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; HeadRev = 'HEAD' } } | Should -Throw '*-HeadRev belongs to -Kind Range*'
         { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'Range'; BaseRev = 'nope'; HeadRev = 'HEAD' } } | Should -Throw '*does not resolve*'
         { Invoke-TestChange @{ WorkingDirectory = $TestDrive; Kind = 'WorkingTree' } } | Should -Throw '*Not inside a git work tree*'
     }
@@ -735,6 +739,241 @@ Describe 'Export-OgDiffSides: type changes (Range)' {
         @($toFile.Files | ForEach-Object { "$($_.Path)=$($_.Status)" }) | Should -Be @('sub=Added')
         Get-TestRelFiles $toFile.BaseDestination | Should -Be @()
         Get-TestRelFiles $toFile.HeadDestination | Should -Be @('sub')
+    }
+}
+
+Describe 'Export-OgDiffSides: a revision against the working tree (WorkingTree -BaseRev, od task 9)' {
+    BeforeAll {
+        # Three commits, then uncommitted work, so every source of a difference is present at once:
+        #   C0 (HEAD~2): New-TestSidesRepo.
+        #   C1 (HEAD~1): mod.txt edited, committed-added.txt added, del.txt deleted, bin.dat replaced, and
+        #                keep.txt edited (a BOUNCE: C2 puts it back).
+        #   C2 (HEAD):   keep.txt back to C0's content, mod.txt edited again, 'old name.txt' and the nested
+        #                file deleted.
+        #   staged:      the non-ASCII file edited and added.
+        #   disk only:   committed-added.txt edited; 'old name.txt' back on disk UNTRACKED with C0's content
+        #                (must drop out), the nested file back UNTRACKED with new content (Modified).
+        #   untracked:   untracked.txt; ignored: debug.log; stat-dirty, unchanged: keep.txt, crlf.txt.
+        function New-TestRevRepo {
+            $dir = New-TestSidesRepo
+            Write-TestText  $dir 'mod.txt' "c1`r`n"
+            Write-TestText  $dir 'committed-added.txt' "added in c1`r`n"
+            Remove-Item -LiteralPath (Join-Path $dir 'del.txt')
+            Write-TestBytes $dir 'bin.dat' $script:BinHead
+            Write-TestText  $dir 'keep.txt' "keep changed in c1`r`n"
+            Invoke-TestGit $dir add -A | Out-Null
+            Invoke-TestGit $dir commit -q -m c1 | Out-Null
+
+            Write-TestText  $dir 'keep.txt' "keep`r`n"
+            Write-TestText  $dir 'mod.txt' "c2`r`n"
+            Invoke-TestGit $dir rm -q -- 'old name.txt' 'nested/deep/er/file.txt' | Out-Null
+            Invoke-TestGit $dir add -A | Out-Null
+            Invoke-TestGit $dir commit -q -m c2 | Out-Null
+
+            Write-TestText $dir $script:UniFile "uni staged`r`n"
+            Invoke-TestGit $dir add -- $script:UniFile | Out-Null
+            Write-TestText $dir 'committed-added.txt' "edited on disk`r`n"
+            Write-TestText $dir 'old name.txt' "renamed`r`n"
+            Write-TestText $dir 'nested/deep/er/file.txt' "back, different`r`n"
+            Write-TestText $dir 'untracked.txt' "untracked`r`n"
+            Write-TestText $dir 'debug.log' "ignored`r`n"
+            Set-TestStatDirty $dir 'keep.txt', 'crlf.txt'
+            $dir
+        }
+
+        # A listing as comparable text: every field of every file, in order.
+        function Format-TestChangeSet {
+            param($ChangeSet)
+            @($ChangeSet.Files | ForEach-Object {
+                '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}' -f $_.Path, $_.Status, $_.OnBase, $_.OnHead, $_.Untracked,
+                    $_.BaseMode, $_.BaseObject, $_.HeadMode, $_.HeadObject
+            }) -join "`n"
+        }
+
+        $script:rRepo = New-TestRevRepo
+        $script:rOut  = New-TestDir 'rev-out'
+        $script:rBefore = Get-TestRepoSnapshot $script:rRepo
+        $script:rResult = Invoke-TestSides @{ WorkingDirectory = $script:rRepo; Kind = 'WorkingTree'; BaseRev = 'HEAD~2'
+            BaseDestination = (Join-Path $script:rOut 'base'); HeadDestination = (Join-Path $script:rOut 'working') }
+        $script:rAfter = Get-TestRepoSnapshot $script:rRepo
+    }
+
+    It 'lists committed, staged, disk-only and untracked changes since the given revision, and nothing else' {
+        $expected = [ordered]@{
+            'bin.dat'                 = 'Modified'   # C1
+            'committed-added.txt'     = 'Added'      # C1, then edited on disk
+            'del.txt'                 = 'Deleted'    # C1
+            'mod.txt'                 = 'Modified'   # C1 and C2
+            'nested/deep/er/file.txt' = 'Modified'   # deleted by C2, back on disk with new content
+            'untracked.txt'           = 'Added'      # untracked
+        }
+        $expected[$script:UniFile] = 'Modified'      # staged
+        $actual = @($script:rResult.Files | ForEach-Object { "$($_.Path)=$($_.Status)" }) | Sort-Object -CaseSensitive
+        $want   = @($expected.Keys | ForEach-Object { "$_=$($expected[$_])" }) | Sort-Object -CaseSensitive
+        ($actual -join '|') | Should -BeExactly ($want -join '|')
+        # keep.txt bounced back (C1 then C2), 'old name.txt' is back on disk unchanged, crlf.txt is only
+        # stat-dirty, debug.log is ignored: none of them differs from HEAD~2's tree.
+        foreach ($absent in 'keep.txt', 'old name.txt', 'crlf.txt', 'debug.log') {
+            $script:rResult.Files.Path | Should -Not -Contain $absent
+        }
+        @($script:rResult.Files | Where-Object Untracked | ForEach-Object Path | Sort-Object) |
+            Should -Be @('nested/deep/er/file.txt', 'untracked.txt')
+    }
+
+    It 'names the revision as the base commit and the working tree as the head' {
+        $script:rResult.Kind | Should -Be 'WorkingTree'
+        $script:rResult.BaseCommit | Should -Be (Invoke-TestGit $script:rRepo rev-parse 'HEAD~2')
+        $script:rResult.HeadCommit | Should -BeNullOrEmpty
+    }
+
+    It 'exports the base side from the revision (checkout conversion) and the head side from disk' {
+        $base = $script:rResult.BaseDestination; $head = $script:rResult.HeadDestination
+        Get-TestRelFiles $base | Should -Be (@('bin.dat', 'del.txt', 'mod.txt', 'nested/deep/er/file.txt',
+            $script:UniFile) | Sort-Object -CaseSensitive)
+        Get-TestRelFiles $head | Should -Be (@('bin.dat', 'committed-added.txt', 'mod.txt', 'nested/deep/er/file.txt',
+            'untracked.txt', $script:UniFile) | Sort-Object -CaseSensitive)
+        $script:Utf8.GetString((Read-TestBytes $base 'mod.txt')) | Should -BeExactly "before`r`n"
+        $script:Utf8.GetString((Read-TestBytes $head 'mod.txt')) | Should -BeExactly "c2`r`n"
+        $script:Utf8.GetString((Read-TestBytes $base 'nested/deep/er/file.txt')) | Should -BeExactly "deep`r`n"
+        $script:Utf8.GetString((Read-TestBytes $head 'nested/deep/er/file.txt')) | Should -BeExactly "back, different`r`n"
+        $script:Utf8.GetString((Read-TestBytes $head 'committed-added.txt')) | Should -BeExactly "edited on disk`r`n"
+        $script:Utf8.GetString((Read-TestBytes $head $script:UniFile)) | Should -BeExactly "uni staged`r`n"
+        (Read-TestBytes $base 'bin.dat') | Should -Be $script:BinBase
+        (Read-TestBytes $head 'bin.dat') | Should -Be $script:BinHead
+    }
+
+    It 'gives the side folders the task 7 names: REPO base SHA7 and REPO working' {
+        $labels = InModuleScope og-framework -Parameters @{ C = $script:rResult } {
+            Get-OgDiffSideLabel -ChangeSet $C -RepoFolderName 'proj'
+        }
+        $sha7 = (Invoke-TestGit $script:rRepo rev-parse 'HEAD~2').Substring(0, 7)
+        $labels.Base | Should -BeExactly "proj base $sha7"
+        $labels.Head | Should -BeExactly 'proj working'
+    }
+
+    It 'is read-only on the repo: index bytes, no-optional-locks status, refs, HEAD and config unchanged' {
+        $script:rAfter.IndexHash  | Should -Be $script:rBefore.IndexHash
+        $script:rAfter.Status     | Should -BeExactly $script:rBefore.Status
+        $script:rAfter.Refs       | Should -BeExactly $script:rBefore.Refs
+        $script:rAfter.Head       | Should -BeExactly $script:rBefore.Head
+        $script:rAfter.ConfigHash | Should -Be $script:rBefore.ConfigHash
+    }
+
+    It 'by default still compares against HEAD: no -BaseRev, -BaseRev HEAD and HEAD''s full id list the same' {
+        $default = Invoke-TestChange @{ WorkingDirectory = $script:rRepo; Kind = 'WorkingTree' }
+        $named   = Invoke-TestChange @{ WorkingDirectory = $script:rRepo; Kind = 'WorkingTree'; BaseRev = 'HEAD' }
+        $headSha = Invoke-TestGit $script:rRepo rev-parse HEAD
+        $byId    = Invoke-TestChange @{ WorkingDirectory = $script:rRepo; Kind = 'WorkingTree'; BaseRev = $headSha }
+        $default.BaseCommit | Should -Be $headSha
+        # Not vacuous: against HEAD the fixture lists a different set than against HEAD~2.
+        (Format-TestChangeSet $default) | Should -Not -BeExactly (Format-TestChangeSet $script:rResult)
+        @($default.Files | ForEach-Object { "$($_.Path)=$($_.Status)" }) | Should -Contain 'old name.txt=Added'
+        foreach ($cs in $named, $byId) {
+            (Format-TestChangeSet $cs) | Should -BeExactly (Format-TestChangeSet $default)
+            $cs.BaseCommit | Should -Be $headSha
+            $cs.FileCount | Should -Be $default.FileCount
+        }
+    }
+
+    It 'takes the base from an unrelated branch as a plain tree comparison (no merge base)' {
+        $repo = New-TestSidesRepo
+        Invoke-TestGit $repo checkout -q -b side | Out-Null
+        Write-TestText $repo 'side-only.txt' "side`r`n"
+        Write-TestText $repo 'mod.txt' "side`r`n"
+        Invoke-TestGit $repo add -A | Out-Null
+        Invoke-TestGit $repo commit -q -m side | Out-Null
+        Invoke-TestGit $repo checkout -q - | Out-Null
+        Write-TestText $repo 'main-only.txt' "main`r`n"
+        Invoke-TestGit $repo add -A | Out-Null
+        Invoke-TestGit $repo commit -q -m main | Out-Null
+
+        $r = Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'side' }
+        @($r.Files | ForEach-Object { "$($_.Path)=$($_.Status)" } | Sort-Object -CaseSensitive) |
+            Should -Be @('main-only.txt=Added', 'mod.txt=Modified', 'side-only.txt=Deleted')
+        $r.BaseCommit | Should -Be (Invoke-TestGit $repo rev-parse side)
+    }
+}
+
+Describe 'Export-OgDiffSides: WorkingTree against an EMPTY base (-BaseRev '''', od task 9)' {
+    It 'lists every working-tree file as Added, untracked included, with an empty base side' {
+        $repo = New-TestSidesRepo                                   # 9 tracked files
+        Write-TestText $repo 'mod.txt' "after`r`n"
+        Remove-Item -LiteralPath (Join-Path $repo 'del.txt')        # tracked, gone from disk: not a file now
+        Write-TestText $repo 'untracked.txt' "untracked`r`n"
+        Write-TestText $repo 'debug.log' "ignored`r`n"
+        Set-TestStatDirty $repo 'keep.txt'
+        $before = Get-TestRepoSnapshot $repo
+        $out = New-TestDir 'wt-empty-base'
+        $r = Invoke-TestSides @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = ''
+            BaseDestination = (Join-Path $out 'base'); HeadDestination = (Join-Path $out 'working') }
+        $after = Get-TestRepoSnapshot $repo
+
+        $expected = @('.gitignore', 'bin.dat', 'crlf.txt', 'keep.txt', 'mod.txt', 'nested/deep/er/file.txt',
+            'old name.txt', 'untracked.txt', $script:UniFile) | Sort-Object -CaseSensitive
+        @($r.Files.Path | Sort-Object -CaseSensitive) | Should -Be $expected
+        @($r.Files.Status | Sort-Object -Unique) | Should -Be @('Added')
+        @($r.Files | Where-Object OnBase) | Should -BeNullOrEmpty
+        $r.BaseCommit | Should -BeNullOrEmpty
+        $r.HeadCommit | Should -BeNullOrEmpty
+        Get-TestRelFiles $r.BaseDestination | Should -Be @()
+        Get-TestRelFiles $r.HeadDestination | Should -Be $expected
+        $script:Utf8.GetString((Read-TestBytes $r.HeadDestination 'mod.txt')) | Should -BeExactly "after`r`n"
+
+        $labels = InModuleScope og-framework -Parameters @{ C = $r } { Get-OgDiffSideLabel -ChangeSet $C -RepoFolderName 'proj' }
+        $labels.Base | Should -BeExactly 'proj base empty'
+        $labels.Head | Should -BeExactly 'proj working'
+
+        $after.IndexHash | Should -Be $before.IndexHash
+        $after.Status    | Should -BeExactly $before.Status
+        $after.Refs      | Should -BeExactly $before.Refs
+    }
+
+    It 'equals the default in an unborn repo (both compare against the empty tree)' {
+        $repo = New-TestDir 'wt-unborn'
+        Invoke-TestGit $repo init -q | Out-Null
+        Write-TestText $repo 'first.txt' 'x'
+        Write-TestText $repo 'staged.txt' 'y'
+        Invoke-TestGit $repo add -- 'staged.txt' | Out-Null
+        $default = Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree' }
+        $empty   = Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = '' }
+        @($empty.Files | ForEach-Object { "$($_.Path)=$($_.Status)=$($_.Untracked)" }) |
+            Should -Be @('first.txt=Added=True', 'staged.txt=Added=False')
+        @($empty.Files | ForEach-Object { "$($_.Path)=$($_.Status)=$($_.Untracked)" }) |
+            Should -Be @($default.Files | ForEach-Object { "$($_.Path)=$($_.Status)=$($_.Untracked)" })
+        # The unborn fallback belongs to the default only: a NAMED HEAD must resolve.
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'HEAD' } } | Should -Throw '*does not resolve*'
+    }
+}
+
+Describe 'Export-OgDiffSides: WorkingTree -BaseRev refusals (od task 9)' {
+    It 'refuses an option-like revision before git sees it, writing nothing' {
+        $repo = New-TestSidesRepo
+        Write-TestText $repo 'mod.txt' "after`r`n"
+        $before = Get-TestRepoSnapshot $repo
+        $out = New-TestDir 'optlike'
+        $trap = Join-Path $out 'written-by-git.txt'
+        foreach ($rev in "--output=$trap", '-p', '--all') {
+            { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = $rev } } |
+                Should -Throw "*Invalid revision '$rev'*"
+            { Invoke-TestSides @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = $rev
+                BaseDestination = (Join-Path $out 'base'); HeadDestination = (Join-Path $out 'working') } } |
+                Should -Throw "*Invalid revision*"
+        }
+        Test-Path -LiteralPath $trap | Should -BeFalse
+        # Listed before any destination is touched: no side folder was created.
+        Test-Path -LiteralPath (Join-Path $out 'base') | Should -BeFalse
+        $after = Get-TestRepoSnapshot $repo
+        $after.IndexHash | Should -Be $before.IndexHash
+        $after.Status    | Should -BeExactly $before.Status
+        $after.Refs      | Should -BeExactly $before.Refs
+    }
+
+    It 'refuses a revision that is missing or not a commit, and git-dir mode' {
+        $repo = New-TestSidesRepo
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'no-such-rev' } } | Should -Throw '*does not resolve*'
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'HEAD^{tree}' } } | Should -Throw '*does not resolve*'
+        { Invoke-TestChange @{ WorkingDirectory = $repo; Kind = 'WorkingTree'; BaseRev = 'HEAD'
+            GitDir = (Join-Path $repo '.git') } } | Should -Throw '*-GitDir belongs to -Kind Range*'
     }
 }
 

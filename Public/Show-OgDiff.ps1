@@ -5,13 +5,21 @@ function Show-OgDiff {
         Opens what changed across the og-framework tree in the configured diff tool: by default one
         directory diff per changed repo, all as tabs of ONE tool instance; with -PerFile, git difftool's
         per-file windows. Compares the working tree by default, the index with -Staged, the branch
-        against a ref (e.g. origin/main) with -Against, or what one root commit (one `oggitcommit` run)
-        changed in every repo with -Commit, or with -Pick, a commit picked from a list of the recent ones.
+        against a ref (e.g. origin/main) with -Against, what one root commit (one `oggitcommit` run)
+        changed in every repo with -Commit, or with -Pick, a commit (or a range) picked from a list of
+        the recent ones, or what changed between two root commits with -From <A> [-To <B>], or between
+        root commit <A> and the working tree with -From <A> -IncludeWorkingTree.
 
     .DESCRIPTION
         Every repo of the og tree takes part: the project root and its submodules, recursively, in
-        Resolve-OgRepoTree's order. A repo whose folder is missing (a submodule not checked out) is
-        skipped. Four comparisons:
+        Resolve-OgRepoTree's order. In the modes that sweep the checked-out tree (the default, -Staged,
+        -Against and -From -IncludeWorkingTree, also with -PerFile), a submodule that is not checked out
+        is skipped, with a verbose message when its folder exists: its folder is missing, or it is an
+        empty folder that is not its own work tree (never initialised, e.g. after a clone without
+        --recurse-submodules, or deinit-ed), where git would reach the PARENT repo instead (for the one
+        exception under -From -IncludeWorkingTree, see there). -Commit and -From -To list the repos the
+        commits' pins name instead, and read such a submodule's commits from the git dir its parent
+        kept (see -Commit below). The comparisons:
 
           (default)  the working tree vs HEAD: "what have I not committed?". Untracked files that are
                      not ignored count as changes, so a repo with only a new file opens too.
@@ -20,8 +28,12 @@ function Show-OgDiff {
                      "how does my branch differ from <ref>?".
           -Commit    one root commit, i.e. one `oggitcommit` run: "what did that run change?". See
                      -Commit below.
-          -Pick      the same, for a root commit you pick from a list of the recent ones. See -Pick
-                     below.
+          -Pick      the same, for a root commit you pick from a list of the recent ones, or a range
+                     you pick there: between two listed commits, or from one of them to HEAD or to the
+                     working tree (as -From). See -Pick below.
+          -From      two root commits, <A> to <B> (-To, default HEAD): "what changed between them?",
+                     or <A> to the working tree with -IncludeWorkingTree: "what changed since <A>,
+                     my uncommitted work included?". See -From below.
 
         Why -Against is three dots: it is what you want when preparing a merge. On a clean working tree
         (the state you are in right before merging) the working-tree comparison reports every repo clean
@@ -37,10 +49,12 @@ function Show-OgDiff {
             opens nothing;
           - each changed repo's CHANGED FILES ONLY are exported into a new run folder
                 $env:TEMP\og-diff\<yyyyMMdd-HHmmss>-<label>\<repo>\{<base side>,<head side>}
-            with the label worktree, staged or against-<ref> (made filesystem-safe and cut to 24
-            characters, so a long ref name cannot push the paths past 260 characters), and each side
-            named after its repo: '<repo> base <short sha>', '<repo> head <short sha>', '<repo> working'
-            or '<repo> index' ('<repo> base empty' / '<repo> head empty' for an empty side). Diffinity
+            with the label worktree, staged or against-<ref> (commit-<short sha>, range-<A short>-<B short>
+            or range-<A short>-working for -Commit, -From and what -Pick picks; see there), made
+            filesystem-safe and cut to 24 characters so that a long ref name cannot push the paths past
+            260 characters, and each side named after its repo: '<repo> base <short sha>',
+            '<repo> head <short sha>', '<repo> working' or '<repo> index' ('<repo> base empty' /
+            '<repo> head empty' for an empty side). Diffinity
             titles a tab from the two folder names, so a tab reads e.g.
             'og-brawler base e289ac3 - og-brawler head db4ec6a'. A modified file is on both sides, an
             added file on the head side only, a deleted file on the base side only. A submodule is never a
@@ -136,26 +150,90 @@ function Show-OgDiff {
         The columns are the short sha, the author date (local time), the repos the commit touched and
         the subject. Keys:
           Up/Down, PgUp/PgDn, Home/End   move the selection
-          Enter                          open the selected commit, exactly as -Commit <its sha> would
+          Space                          mark the selected row as one end of a range ('*' after the
+                                         selection marker); Space on the marked row clears the mark,
+                                         Space on another row moves it (one mark at a time)
+          Enter                          no mark: open the selected commit, exactly as
+                                         -Commit <its sha> would;
+                                         a mark: open the range between the marked and the selected
+                                         row, the OLDER (lower) row as the base, exactly as
+                                         -From <older> -To <newer> would, whichever was marked first;
+                                         on the marked row itself: nothing (the picker stays open)
+          h                              open the selected row to HEAD: -From <its sha> -To HEAD
+          w                              open the selected row to the working tree, uncommitted and
+                                         untracked work included: -From <its sha> -IncludeWorkingTree
           Esc or q                       cancel: nothing is opened and nothing is returned
+        h and w ignore the mark: they always start at the SELECTED row. While a row is marked the header
+        ends in 'base: <short sha>', the base Enter would use from the current selection (the older of
+        the marked and the selected row; on the marked row, where Enter does nothing, the mark itself),
+        so it names neither h's nor w's base. h on the top row (HEAD itself) compares HEAD with HEAD:
+        a warning says there is nothing between them and nothing is opened. A picked range runs the
+        -From path in full: its results, run label (range-<A short>-<B short>, or
+        range-<A short>-working for w) and Commit ($null) are those of the -From command it stands for.
         The touched column is 'root' (the root's own files) or the first touched submodule, plus how many
         more repos the commit touched, e.g. 'root +5', with '(1 missing)' when pin commits are missing
         locally and '(no changes)' for an empty commit. It shows an ellipsis (…) until that commit is
         resolved: only the commits on screen are resolved, the selected one first and each at most once,
         so the list appears at once and fills in while you look (and move). It shows '!' when a commit
         cannot be resolved; the picker keeps working and the reason is on the detail line. Such a commit
-        can still be picked: Enter then fails with the same error as -Commit <its sha>. The detail line
+        can still be picked: Enter then fails with the same error as -Commit <its sha>. As an end of a
+        range (a mark and Enter, h or w) it runs the -From path, which reads the pins of the two ends
+        and never resolves that row's own cascade: the range may open, or fail with the error of the
+        -From command it stands for. The detail line
         below the list names every repo the selected commit touched (the root by its folder name) with
         its base..head range (0000000 for an empty side) and its status when it is not a plain change:
         (added) or (removed); a (missing-commit) repo shows its name only. The ellipsis (U+2026) needs a
         console whose output encoding is UTF-8 (code page 65001); on an OEM code page such as 437 it
         shows as '?'.
         The picker draws on the console's alternate screen, so your screen and scrollback come back as they
-        were when it closes (also on an error or Ctrl+C); the picked commit's results are written after
-        that. It needs an interactive console: with redirected input or output (a script, a pipe, a CI
-        job), or a host without virtual-terminal support, it fails before running any git command, with
-        an error that says to name the commit instead: oggitdiff -Commit <sha>.
-        -PerFile and -Tool apply to the picked commit as they do to -Commit.
+        were when it closes (also on an error or Ctrl+C); the results of what you picked are written
+        after that. It needs an interactive console: with redirected input or output (a script, a pipe, a
+        CI job), or a host without virtual-terminal support, it fails before running any git command,
+        with an error that says to name the commit instead: oggitdiff -Commit <sha> (a range is named
+        with -From <A> [-To <B> | -IncludeWorkingTree]).
+        -PerFile and -Tool apply to what you pick as they do to the -Commit or -From command it stands
+        for.
+
+        -From <A> [-To <B>]: A RANGE BETWEEN TWO ROOT COMMITS. Both name commits in the project root; -To
+        defaults to HEAD. Every repo <A> or <B> reaches through its submodule pins is paired by its
+        og-tree path, and each repo whose pin differs is diffed from its pin at <A> to its pin at <B>:
+          - the root: <A>..<B>, only if they differ in files of the root itself;
+          - each submodule: its pin at <A>..its pin at <B>, exactly the two gitlink ids that the two root
+            commits record (nested pins read from their parent's PINNED commit), never a current HEAD or
+            branch tip. One cascade is the special case: -From X^1 -To X gives the results of -Commit X.
+        TWO-DOT, never a merge base: the two trees are compared as they are, so two unrelated commits
+        (branches with no common history) compare like any other pair, and "what <B> lacks of <A>" shows
+        as deleted. A repo pinned at the same commit at both ends gets no result. A submodule only <B>
+        has is diffed from an empty base (added), one only <A> has to an empty head (removed, read from
+        the git dir its parent kept when it has no work tree), and a pin commit not present locally is a
+        missing-commit result; nothing below it is compared. The run folder is labelled
+        range-<A short>-<B short>, sides '<repo> base <sha>' / '<repo> head <sha>'. The results' Commit
+        is $null (a range has no one root commit; BaseRev/HeadRev are each repo's two pins). Two ends
+        that name the same commit (e.g. -From HEAD) give one warning, 'Nothing between <A short> and
+        <B short>' ('... and HEAD' when -To is HEAD or left out), no result and no run folder.
+
+        -From <A> -IncludeWorkingTree: ROOT COMMIT <A> AGAINST THE WORKING TREE, instead of -To. Every repo
+        of the og tree as it is checked out NOW is compared from its pin at <A> to the files on disk:
+        commits since <A>, staged and unstaged changes and untracked files that are not ignored, all at
+        once (each repo's base is its pin at <A>, never its HEAD). So every checked-out repo of the tree
+        gets a result, 'clean' when nothing differs (plus one per repo only <A> has, and the
+        missing-commit exception below). A repo <A> does not contain (added since) has an empty base:
+        every file Added. A repo <A> pins that the tree no longer has is diffed to an empty head, as a
+        removed one above. A pin missing locally is missing-commit, and so is every repo below it, whose
+        pin at <A> is then unknown (its Error says which repo above it is missing). A repo of the tree
+        that is not checked out (its folder missing, or not its own work tree) is skipped, as in the
+        default mode, and so is every repo <A> pins below it (never reported as removed). The one
+        exception: a submodule that is not checked out, that <A> pins and whose parent keeps NO git dir
+        for it (e.g. never initialised in this clone) is missing-commit, not skipped, because its pin at
+        <A> cannot be checked here. The run folder is labelled range-<A short>-working, sides
+        '<repo> base <sha>' / '<repo> working'. -IncludeWorkingTree and -To are mutually exclusive (a binding error).
+
+        With -PerFile, each repo runs `git difftool --no-prompt <pin at A> <pin at B>`, or `git difftool
+        --no-prompt <pin at A>` against the working tree (tracked files only, as git difftool always
+        compares), after the same "is there a change?" check as the other modes. A repo with an empty
+        side (only one end contains it) or without a work tree here has no per-file form: it reports
+        'failed' with a hint to the directory mode (oggitdiff -From <A> -To <B>, or oggitdiff -From <A>
+        -IncludeWorkingTree).
 
     .PARAMETER ProjectRoot
         Path to the project root. Defaults to the current working directory.
@@ -175,7 +253,8 @@ function Show-OgDiff {
 
     .PARAMETER Staged
         Compare the index (staged changes) vs HEAD instead of the working tree. Mutually exclusive with
-        -Against, -Commit and -Pick (different questions: staged-vs-HEAD vs branch-vs-ref vs one commit).
+        -Against, -Commit, -Pick and -From (different questions: staged-vs-HEAD vs branch-vs-ref vs one
+        commit vs two commits).
 
     .PARAMETER Against
         Compare each repo's HEAD against <ref> using the three-dot range `<ref>...HEAD`: the base side is
@@ -183,7 +262,7 @@ function Show-OgDiff {
         (`git rev-parse --verify --quiet <ref>` fails: a different default branch, never fetched, or the
         ref simply does not exist there) reports Action 'no-ref' and is skipped; it does not abort the
         sweep across the rest of the tree. A repo where <ref> and HEAD have no merge base reports
-        'failed'. Mutually exclusive with -Staged, -Commit and -Pick.
+        'failed'. Mutually exclusive with -Staged, -Commit, -Pick and -From.
 
     .PARAMETER Fetch
         Only valid together with -Against. Runs 'git fetch --recurse-submodules' from the project root
@@ -197,17 +276,35 @@ function Show-OgDiff {
     .PARAMETER Commit
         Diff what one root commit changed across the og tree (see -Commit in the description): a sha,
         short sha or any revision that names a commit in the project root; anything else is an error
-        before anything is listed. Mutually exclusive with -Staged, -Against and -Pick.
+        before anything is listed. Mutually exclusive with -Staged, -Against, -Pick and -From.
 
     .PARAMETER Pick
-        Pick the root commit from a list in the console instead of naming it (see -Pick in the
-        description), then diff it exactly like -Commit. Needs an interactive console. Mutually exclusive
-        with -Staged, -Against and -Commit.
+        Pick the root commit, or a range, from a list in the console instead of naming it (see -Pick in
+        the description), then diff it exactly like the command it stands for: Enter -Commit <sha>, Enter
+        with a mark -From <older> -To <newer>, h -From <sha> -To HEAD, w -From <sha>
+        -IncludeWorkingTree. Needs an interactive console. Mutually exclusive with -Staged, -Against,
+        -Commit and -From.
 
     .PARAMETER Count
         Only with -Pick: how many of the root's recent first-parent commits to list (default 30, 1 to
         10000). Only the ones on screen are resolved, so a long list costs nothing until you scroll to it.
         Given without -Pick, PowerShell prompts for the mandatory -Pick switch of that parameter set.
+
+    .PARAMETER From
+        The base root commit <A> of a range (see -From in the description): a sha, short sha or any
+        revision that names a commit in the project root. Anything else, an option-like value (a leading
+        '-') included, is an error naming -From before anything is listed. Mutually exclusive with
+        -Staged, -Against, -Commit and -Pick.
+
+    .PARAMETER To
+        Only with -From: the head root commit <B> (default HEAD), under the same rules as -From.
+        Mutually exclusive with -IncludeWorkingTree.
+
+    .PARAMETER IncludeWorkingTree
+        Only with -From: compare root commit <A> with the working tree of every repo (uncommitted and
+        untracked work included) instead of with -To. A repo that is not checked out is skipped, except a
+        submodule <A> pins whose parent keeps no git dir for it: missing-commit (see -From <A>
+        -IncludeWorkingTree in the description). Given without -From, PowerShell prompts for -From.
 
     .EXAMPLE
         oggitdiff
@@ -241,32 +338,61 @@ function Show-OgDiff {
     .EXAMPLE
         oggitdiff -Pick
         # Lists the last 30 root commits with the repos each touched; Enter opens the selected one like
-        # oggitdiff -Commit <its sha> (one tab per touched repo), Esc or q opens nothing.
+        # oggitdiff -Commit <its sha> (one tab per touched repo), Esc or q opens nothing. Space on one
+        # row, then Enter on another, opens the range between them like oggitdiff -From <older> -To
+        # <newer>; h opens the selected row to HEAD, w to the working tree.
 
     .EXAMPLE
         oggitdiff -Pick -Count 50
         # The same picker over the last 50 root commits.
 
+    .EXAMPLE
+        oggitdiff -From 758fb77 -To 07414fb
+        # One tab per repo whose pin differs between the two root commits, each from its pin at 758fb77
+        # to its pin at 07414fb (two-dot: no merge base), from one run folder
+        # ...\og-diff\<stamp>-range-758fb77-07414fb.
+
+    .EXAMPLE
+        oggitdiff -From 758fb77
+        # The same up to HEAD: 758fb77..HEAD in every repo.
+
+    .EXAMPLE
+        oggitdiff -From 758fb77 -IncludeWorkingTree
+        # One tab per repo that differs between its pin at 758fb77 and its working tree: what was
+        # committed since, plus what is staged, unstaged or untracked now. Run folder
+        # ...\og-diff\<stamp>-range-758fb77-working.
+
+    .EXAMPLE
+        oggitdiff -From 758fb77 -To 07414fb -PerFile
+        # git difftool's per-file windows: `git difftool --no-prompt <pin at 758fb77> <pin at 07414fb>` in
+        # each repo whose pin differs.
+
     .OUTPUTS
-        PSCustomObject (Og.DiffResult), one per repo whose folder exists, in tree order, with the same
-        fields in every mode:
+        PSCustomObject (Og.DiffResult), one per repo, in tree order, with the same fields in every mode:
           Repo, Path, Action ('opened' | 'clean' | 'failed' | 'no-ref' | 'missing-commit'), Error, Ref,
           Range, BasePath, HeadPath, Commit, BaseRev, HeadRev, FileCount, RunPath
+          With the default mode, -Staged or -Against: one per repo of the tree that is checked out.
           With -Commit: one per repo the commit touched (not one per repo of the tree), in tree order.
-          With -Pick: the same as -Commit for the picked commit, or nothing at all when cancelled.
+          With -Pick: the same as the -Commit or -From command the choice stands for, or nothing at all
+          when cancelled (or for h on HEAD itself).
+          With -From -To: one per repo whose pin differs between the two root commits, in tree order.
+          With -From -IncludeWorkingTree: one per checked-out repo of the tree (plus one per repo only <A>
+          has, and the missing-commit exception under -From <A> -IncludeWorkingTree above).
           - Ref and Range are $null unless -Against was used; then Ref is <ref> and Range is the
             `<ref>...HEAD` string that was compared ($null for a 'no-ref' repo).
           - BaseRev/HeadRev are the full commit ids of the sides ($null for the working tree, the index,
             or a repo that failed before listing). For -Against, BaseRev is the merge base. For -Commit
             they are the repo's old and new pin ($null for an added repo's base or a removed repo's head),
-            also for a missing-commit repo.
+            also for a missing-commit repo; for -From they are its pins at <A> and <B> (-IncludeWorkingTree:
+            BaseRev is its pin at <A>, HeadRev $null, as for the working tree).
           - FileCount is the number of changed files: in the default mode the exported paths (untracked
             files included), with -PerFile the paths git difftool walks (tracked only). $null for a
             'no-ref' or 'missing-commit' repo and for one that failed before it was listed.
           - BasePath/HeadPath/RunPath are the run folder's side folders and the run folder itself, set
             whenever a directory diff was exported (also when its launch then failed, so you can open
             them by hand); $null otherwise and always with -PerFile.
-          - Commit is the root commit's full id with -Commit, on every result; $null otherwise.
+          - Commit is the root commit's full id with -Commit (and -Pick when one commit is picked), on
+            every result; $null otherwise, -From and a picked range included.
     #>
     [CmdletBinding(DefaultParameterSetName = 'WorkingTree')]
     param(
@@ -296,7 +422,21 @@ function Show-OgDiff {
 
         [Parameter(ParameterSetName = 'Pick')]
         [ValidateRange(1, 10000)]
-        [int] $Count = 30
+        [int] $Count = 30,
+
+        # Two parameter sets share -From so that -To and -IncludeWorkingTree are a BINDING error together
+        # (PowerShell cannot resolve a set holding both), like -Staged with -Against. 'Range' is -From
+        # [-To]; 'RangeWorkingTree' is -From -IncludeWorkingTree.
+        [Parameter(Mandatory, ParameterSetName = 'Range')]
+        [Parameter(Mandatory, ParameterSetName = 'RangeWorkingTree')]
+        [string] $From,
+
+        [Parameter(ParameterSetName = 'Range')]
+        [ValidateNotNullOrEmpty()]
+        [string] $To = 'HEAD',
+
+        [Parameter(Mandatory, ParameterSetName = 'RangeWorkingTree')]
+        [switch] $IncludeWorkingTree
     )
 
     $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).ProviderPath
@@ -324,13 +464,16 @@ function Show-OgDiff {
 
     $tree = Resolve-OgRepoTree -ProjectRoot $ProjectRoot
 
+    # Which comparison runs: the parameter set, except under -Pick, where the picker's choice decides
+    # (below). Every flag further down is derived from $mode, never from $PSCmdlet.ParameterSetName.
+    $mode = $PSCmdlet.ParameterSetName
     if ($usingPick) {
         # The resolver scriptblock runs INSIDE the picker's call chain and finds its variables by dynamic
         # lookup, so a name the picker also uses ($ProjectRoot, $Count, $rows, $row, ...) would resolve to
         # the PICKER's variable (od task 5a, N5). Hence the distinct names $pickRoot and $pickTree. Do not
         # "fix" this with .GetNewClosure(): the closure's new module hides this module's private functions,
         # Resolve-OgCommitRange included (measured in review 5a).
-        # The tree is walked ONCE (above) and serves every row the picker resolves and the picked commit.
+        # The tree is walked ONCE (above) and serves every row the picker resolves and what is picked.
         $pickRoot = $ProjectRoot
         $pickTree = $tree
         $pickerArgs = @{
@@ -350,11 +493,26 @@ function Show-OgDiff {
             Write-Verbose 'Pick cancelled: nothing opened.'
             return
         }
-        # From here on -Pick IS -Commit <the picked sha>: same resolver, slots, label and -PerFile path.
-        $Commit = $picked.Sha
+        # Route the Og.PickerChoice (od task 11b): from here on -Pick IS the command line it stands for, with
+        # the same resolvers, slots, labels and -PerFile paths:
+        #   Commit       -Commit <sha>                    (Enter, no mark)
+        #   Range        -From <older> -To <newer|HEAD>   (Enter with a mark; h, whose To is the literal 'HEAD')
+        #   WorkingTree  -From <sha> -IncludeWorkingTree  (w)
+        # The run label comes from From/To (resolved below), never from the choice's Row: for a range, Row is
+        # only the row the key was pressed on, which may be either end.
+        switch ($picked.Kind) {
+            'Commit'      { $mode = 'Commit'; $Commit = $picked.Commit }
+            'Range'       { $mode = 'Range'; $From = $picked.From; $To = $picked.To }
+            'WorkingTree' { $mode = 'RangeWorkingTree'; $From = $picked.From; $IncludeWorkingTree = $true }
+            default       { throw "Show-OgDiff: the picker returned an unknown choice '$($picked.Kind)'; nothing was opened." }
+        }
     }
 
-    $usingCommit  = $PSCmdlet.ParameterSetName -in 'Commit', 'Pick'
+    $usingCommit  = $mode -eq 'Commit'
+    $usingRange   = $mode -in 'Range', 'RangeWorkingTree'
+    # -IncludeWorkingTree:$false is the plain range: -From <A> to HEAD (-To's default).
+    $usingWorking = $usingRange -and $IncludeWorkingTree
+    $usingEntries = $usingCommit -or ($usingRange -and -not $usingWorking)
     $usingAgainst = -not [string]::IsNullOrEmpty($Against)
     $kind         = if ($usingAgainst -or $usingCommit) { 'Range' } elseif ($Staged) { 'Staged' } else { 'WorkingTree' }
 
@@ -364,6 +522,11 @@ function Show-OgDiff {
     $slots    = [System.Collections.Generic.List[object]]::new()
     $requests = [System.Collections.Generic.List[object]]::new()
 
+    # The entry modes share ONE per-entry loop below: $entries (Og.CommitRangeEntry, tree order), the root
+    # commit every result carries ($entryCommit, -Commit only: a range has two ends and no one commit), and
+    # the directory-mode command a -PerFile hint names ($directoryHint).
+    $entryCommit   = $null
+    $directoryHint = $null
     if ($usingCommit) {
         # Throws a clear error when -Commit does not name a commit in the root (nothing is listed then).
         $entries = @(Resolve-OgCommitRange -ProjectRoot $ProjectRoot -Commit $Commit -RepoTree $tree)
@@ -371,18 +534,55 @@ function Show-OgDiff {
             -Arguments 'rev-parse', '--verify', '--quiet', "$Commit^{commit}").StdOut.Trim()
         $shortSha = $rootSha.Substring(0, [Math]::Min(7, $rootSha.Length))
         $label    = "commit-$shortSha"
+        $entryCommit   = $rootSha
+        $directoryHint = "oggitdiff -Commit $shortSha"
         if ($entries.Count -eq 0) {
             Write-Warning "Commit $shortSha changed no file and no submodule pin in '$ProjectRoot'."
         }
+    } elseif ($usingRange) {
+        # Throws a clear error, naming -From or -To, when either does not name a commit in the root or looks
+        # like an option (a leading '-'); nothing is listed then. TWO-DOT on purpose (user, 2026-10-23): the
+        # pins of <A> against the pins of <B>, never a merge base, so two unrelated commits compare too.
+        if ($usingWorking) {
+            $pins = @(Get-OgTreePins -ProjectRoot $ProjectRoot -Commit $From -RepoTree $tree)
+            $fromSha = @($pins | Where-Object { $_.Path -eq '' })[0].Pin
+        } else {
+            $entries = @(Resolve-OgTreeRange -ProjectRoot $ProjectRoot -From $From -To $To -RepoTree $tree)
+            $toSha   = (Invoke-Git -WorkingDirectory $ProjectRoot `
+                -Arguments 'rev-parse', '--verify', '--quiet', "$To^{commit}").StdOut.Trim()
+            $toShort = $toSha.Substring(0, [Math]::Min(7, $toSha.Length))
+            $fromSha = (Invoke-Git -WorkingDirectory $ProjectRoot `
+                -Arguments 'rev-parse', '--verify', '--quiet', "$From^{commit}").StdOut.Trim()
+        }
+        $fromShort = $fromSha.Substring(0, [Math]::Min(7, $fromSha.Length))
+        if ($usingWorking) {
+            $label         = "range-$fromShort-working"
+            $directoryHint = "oggitdiff -From $fromShort -IncludeWorkingTree"
+        } else {
+            $label         = "range-$fromShort-$toShort"
+            $directoryHint = "oggitdiff -From $fromShort -To $toShort"
+            if ($fromSha -eq $toSha) {
+                # E.g. the picker's h on its top row (HEAD itself): <HEAD sha>..HEAD is empty in every repo. Said
+                # plainly instead of "differ in no file", which would suggest two commits were compared. The other end
+                # is named as HEAD only when -To is literally HEAD (h, or the default): any other revision, a full
+                # 40-character sha included, prints as its short sha like the -From end (od review 11b, N3).
+                # Case-sensitive on purpose: 'HEAD' is the name git documents; a 'head' prints its short sha.
+                $toShown = if ($To -ceq 'HEAD') { 'HEAD' } else { $toShort }
+                Write-Warning "Nothing between $fromShort and ${toShown}: both name the same commit, so there is nothing to compare in '$ProjectRoot'."
+            } elseif ($entries.Count -eq 0) {
+                Write-Warning "$fromShort and $toShort differ in no file and no submodule pin in '$ProjectRoot'."
+            }
+        }
     }
 
-    foreach ($entry in $(if ($usingCommit) { $entries } else { @() })) {
-        # The entries come in tree order (root, then depth-first) and name only the repos the commit
-        # touched. The ranges ARE the pins (Resolve-OgCommitRange): never replace them with a submodule's
-        # HEAD or tip, which may have moved on since this commit.
+    foreach ($entry in $(if ($usingEntries) { $entries } else { @() })) {
+        # The entries come in tree order (root, then depth-first) and name only the repos the commit (or
+        # the range) touched. The ranges ARE the pins (Resolve-OgCommitRange, Resolve-OgTreeRange): never
+        # replace them with a submodule's HEAD or tip, which may have moved on since.
         $repo    = [PSCustomObject]@{ Name = $entry.Repo; Path = $entry.Path; AbsolutePath = $entry.WorkingDirectory }
         $display = if ([string]::IsNullOrEmpty($entry.Path)) { $entry.Repo } else { $entry.Path }
-        $revs    = @{ BaseRev = $entry.BaseRev; HeadRev = $entry.HeadRev; Commit = $rootSha }
+        $revs    = @{ BaseRev = $entry.BaseRev; HeadRev = $entry.HeadRev }
+        if ($entryCommit) { $revs.Commit = $entryCommit }
 
         # Not diffable: a pin commit missing locally, or no repo found to read the commits from (GitDir ''
         # without a work tree: never initialised, or removed with its git dir by oggitsubrm). Reported,
@@ -400,12 +600,14 @@ function Show-OgDiff {
             # empty side, and a removed one (or one present only under modules/) has no work tree: there is
             # no per-file equivalent, so say so instead of opening nothing or the wrong repo.
             $why = if (-not $entry.HasWorkTree) { 'it has no work tree here (removed, or present only in its parent''s modules/)' }
-                   elseif ([string]::IsNullOrEmpty($entry.BaseRev)) { 'the commit added it (empty base side)' }
-                   elseif ([string]::IsNullOrEmpty($entry.HeadRev)) { 'the commit removed it (empty head side)' }
+                   elseif ([string]::IsNullOrEmpty($entry.BaseRev)) {
+                       if ($usingCommit) { 'the commit added it (empty base side)' } else { "$fromShort does not contain it (empty base side)" } }
+                   elseif ([string]::IsNullOrEmpty($entry.HeadRev)) {
+                       if ($usingCommit) { 'the commit removed it (empty head side)' } else { "$toShort does not contain it (empty head side)" } }
                    else { $null }
             if ($why) {
                 $message = "No per-file diff for '$display': $why, which git difftool cannot show. " +
-                    "Use the directory mode: oggitdiff -Commit $shortSha"
+                    "Use the directory mode: $directoryHint"
                 Write-Warning $message
                 New-OgDiffResult -Repo $repo -Action 'failed' -ErrorMessage $message @revs
                 continue
@@ -416,8 +618,10 @@ function Show-OgDiff {
 
         $requestArgs = @{
             Repo = $entry.Repo; Path = $entry.Path; WorkingDirectory = $entry.WorkingDirectory; Kind = 'Range'
-            BaseRev = $entry.BaseRev; HeadRev = $entry.HeadRev; Commit = $rootSha
+            BaseRev = $entry.BaseRev; HeadRev = $entry.HeadRev
         }
+        # Only when set: New-OgDirDiffRequest carries a bound -Commit as given, so $null would become ''.
+        if ($entryCommit) { $requestArgs.Commit = $entryCommit }
         # No work tree (a submodule the commit removed): its commits are only in the git dir its parent
         # kept, so the engine reads them from there (git-dir mode). Never export such an entry from
         # WorkingDirectory: git run there finds the PARENT repo (od task 4a).
@@ -426,9 +630,90 @@ function Show-OgDiff {
         $requests.Add((New-OgDirDiffRequest @requestArgs))
     }
 
-    foreach ($repo in $(if ($usingCommit) { @() } else { $tree })) {
+    # -From <A> -IncludeWorkingTree (R3): every repo of the CURRENT tree, from its pin at <A> to its
+    # working tree (untracked files included), plus the repos <A> has that the tree no longer has.
+    foreach ($item in $(if ($usingWorking) { Get-OgDiffWorkingRangeItem -Pin $pins -RepoTree $tree } else { @() })) {
+        $pin     = $item.Pin
+        $repo    = $item.Repo
+        $display = if ([string]::IsNullOrEmpty($repo.Path)) { $repo.Name } else { $repo.Path }
+
+        # Not diffable: the pin at <A> is missing locally, or unknown because a repo above it is.
+        if ($item.Kind -in 'missing-commit', 'unknown') {
+            $reason = if ($item.Kind -eq 'missing-commit') { $pin.Error } else {
+                $above = if ($item.Above.Path) { $item.Above.Path } else { $item.Above.Repo }
+                "Its pin at $fromShort is unknown: '$above' is missing-commit there, so the pins below it cannot be read."
+            }
+            Write-Warning "Skipped '$display' (missing-commit): $reason"
+            $missingArgs = @{ Repo = $repo; Action = 'missing-commit'; ErrorMessage = $reason }
+            if ($item.Kind -eq 'missing-commit') { $missingArgs.BaseRev = $pin.Pin }
+            $result = New-OgDiffResult @missingArgs
+            if ($PerFile) { $result } else { $slots.Add($result) }
+            continue
+        }
+
+        if ($item.Kind -eq 'not-checked-out') {
+            # As the default mode skips a repo whose folder is missing: there is no working tree to compare.
+            Write-Verbose "Skipped '$display': it is in the og tree but not checked out here (no work tree of its own)."
+            continue
+        }
+
+        if ($item.Kind -eq 'working') {
+            # $pin.Pin is '' for a repo <A> does not contain: an EMPTY base, every file Added. It is passed
+            # as a value on purpose; a WorkingTree request without -BaseRev compares against HEAD instead.
+            if ($PerFile) {
+                if ([string]::IsNullOrEmpty($pin.Pin)) {
+                    $message = "No per-file diff for '$display': $fromShort does not contain it (empty base side), " +
+                        "which git difftool cannot show. Use the directory mode: $directoryHint"
+                    Write-Warning $message
+                    New-OgDiffResult -Repo $repo -Action 'failed' -ErrorMessage $message
+                    continue
+                }
+                Invoke-OgPerFileDiff -Repo $repo -Kind 'WorkingTree' -BaseRev $pin.Pin -Tool $Tool
+                continue
+            }
+            $slots.Add([int] $requests.Count)
+            $requests.Add((New-OgDirDiffRequest -Repo $repo.Name -Path $repo.Path -WorkingDirectory $repo.AbsolutePath `
+                -Kind 'WorkingTree' -BaseRev $pin.Pin))
+            continue
+        }
+
+        # 'gone': <A> pins it, the current tree has no such repo: <A>'s files against an empty head, read from
+        # its own work tree if it still has one, else from the git dir its parent kept (git-dir mode, 4b).
+        if (-not $pin.HasWorkTree -and [string]::IsNullOrEmpty($pin.GitDir)) {
+            $reason = "No git dir found for '$display'."
+            Write-Warning "Skipped '$display' (missing-commit): $reason"
+            $result = New-OgDiffResult -Repo $repo -Action 'missing-commit' -ErrorMessage $reason -BaseRev $pin.Pin
+            if ($PerFile) { $result } else { $slots.Add($result) }
+            continue
+        }
+        if ($PerFile) {
+            $message = "No per-file diff for '$display': the working tree does not contain it (empty head side), " +
+                "which git difftool cannot show. Use the directory mode: $directoryHint"
+            Write-Warning $message
+            New-OgDiffResult -Repo $repo -Action 'failed' -ErrorMessage $message -BaseRev $pin.Pin
+            continue
+        }
+        $requestArgs = @{
+            Repo = $repo.Name; Path = $repo.Path; WorkingDirectory = $repo.AbsolutePath; Kind = 'Range'
+            BaseRev = $pin.Pin; HeadRev = ''
+        }
+        if (-not $pin.HasWorkTree) { $requestArgs.GitDir = $pin.GitDir }
+        $slots.Add([int] $requests.Count)
+        $requests.Add((New-OgDirDiffRequest @requestArgs))
+    }
+
+    foreach ($repo in $(if ($usingCommit -or $usingRange) { @() } else { $tree })) {
         $absPath = $repo.AbsolutePath
         if (-not (Test-Path -LiteralPath $absPath)) { continue }
+        # An uninitialised or deinit-ed submodule is an EMPTY folder inside its parent's work tree: every git
+        # command run there (rev-parse --show-toplevel, diff, difftool) reaches the PARENT repo, so it would
+        # be diffed a second time as the parent (od task 11b). "The folder exists" is not enough: it must be
+        # its own work tree's top (4a's test, as -From -IncludeWorkingTree uses). Submodules only: the root
+        # is the folder the caller named (-ProjectRoot) and is diffed as before, unchecked.
+        if ($repo.Path -and -not (Get-OgCommitRangeOwnWorkTree -Directory $absPath)) {
+            Write-Verbose "Skipped '$($repo.Path)': it is in the og tree but not checked out here (no work tree of its own)."
+            continue
+        }
 
         # Resolve <ref> per repo: it may not exist here (different default branch, never fetched, or
         # simply absent). A miss must not abort the sweep of the remaining repos.
@@ -482,7 +767,7 @@ function Show-OgDiff {
 
     $setResults = @()
     if ($requests.Count -gt 0) {
-        if (-not $usingCommit) {
+        if (-not ($usingCommit -or $usingRange)) {
             $label = switch ($kind) { 'Range' { "against-$Against" } 'Staged' { 'staged' } default { 'worktree' } }
         }
         # @() on purpose: one request gives one bare result, which must still index as element 0.

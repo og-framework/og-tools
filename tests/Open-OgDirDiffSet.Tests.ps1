@@ -864,6 +864,70 @@ Describe 'Open-OgDirDiffSet (od task 2)' {
             { Invoke-TestOpen @{ Request = @([PSCustomObject] $Req); Label = 'x' } } | Should -Throw "Open-OgDirDiffSet: request 0*"
             Should -Invoke -ModuleName og-framework Get-OgDiffChange -Times 0
         }
+
+        It 'od task 10: a WorkingTree request takes an optional -BaseRev (stored as given, '''' included) and never a -HeadRev' {
+            $wt = New-TestRequest @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'WorkingTree'; BaseRev = 'abc' }
+            $wt.BaseRev | Should -BeExactly 'abc'
+            $null -eq $wt.HeadRev | Should -BeTrue
+            $empty = New-TestRequest @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'WorkingTree'; BaseRev = '' }
+            $empty.BaseRev | Should -BeExactly ''
+            $null -eq $empty.BaseRev | Should -BeFalse
+            { New-TestRequest @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'WorkingTree'; HeadRev = 'a' } } |
+                Should -Throw '*-HeadRev belongs to -Kind Range*'
+            { New-TestRequest @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'WorkingTree'; BaseRev = 'a'; HeadRev = 'b' } } |
+                Should -Throw '*-HeadRev belongs to -Kind Range*'
+            { New-TestRequest @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'Staged'; BaseRev = 'a' } } | Should -Throw '*belong to -Kind Range*'
+        }
+
+        It 'od task 10: Open-OgDirDiffSet refuses a hand-built <Kind> request carrying <Rev> before listing anything' -ForEach @(
+            @{ Kind = 'WorkingTree'; Rev = 'HeadRev'; Req = @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'WorkingTree'; HeadRev = 'HEAD' } }
+            @{ Kind = 'Staged';      Rev = 'BaseRev'; Req = @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'Staged'; BaseRev = 'HEAD' } }
+            @{ Kind = 'Staged';      Rev = 'HeadRev'; Req = @{ Repo = 'r'; WorkingDirectory = 'C:\x'; Kind = 'Staged'; HeadRev = '' } }
+        ) {
+            Mock -ModuleName og-framework Get-OgDiffChange { throw 'must not list' }
+            { Invoke-TestOpen @{ Request = @([PSCustomObject] $Req); Label = 'x' } } |
+                Should -Throw "Open-OgDirDiffSet: request 0 is a $Kind request with a '$Rev'*"
+            Should -Invoke -ModuleName og-framework Get-OgDiffChange -Times 0
+        }
+
+        It 'od task 10: a WorkingTree base is forwarded only when the request carries one: none or $null = HEAD, '''' = every file Added, a commit = since that commit' {
+            # Three committed files over two commits, one of them edited on disk: against HEAD exactly ONE file
+            # differs. THE TRAP (od review 9): `[string] $req.BaseRev` turns a request's $null into '', the EMPTY
+            # base, and every plain working-tree diff would list all three files as Added.
+            $dir = New-TestDiffRepo 'trap'
+            $first = Invoke-TestGit $dir rev-parse HEAD
+            Write-TestText $dir 'b.txt' "bee`n"
+            Write-TestText $dir 'c.txt' "sea`n"
+            Invoke-TestGit $dir add -- 'b.txt' 'c.txt' | Out-Null
+            Invoke-TestGit $dir commit -q -m 'two more' | Out-Null
+            $head = Invoke-TestGit $dir rev-parse HEAD
+            Write-TestText $dir 'b.txt' "bee edited`n"
+
+            $plain    = New-TestWorkingRequest -Repo 'plain' -Dir $dir
+            $nullBase = [PSCustomObject]@{ Repo = 'nullbase'; Path = 'nullbase'; WorkingDirectory = $dir; Kind = 'WorkingTree'; BaseRev = $null }
+            $noProp   = [PSCustomObject]@{ Repo = 'noprop'; Path = 'noprop'; WorkingDirectory = $dir; Kind = 'WorkingTree' }
+            $empty    = New-TestRequest @{ Repo = 'empty'; Path = 'empty'; WorkingDirectory = $dir; Kind = 'WorkingTree'; BaseRev = '' }
+            $since    = New-TestRequest @{ Repo = 'since'; Path = 'since'; WorkingDirectory = $dir; Kind = 'WorkingTree'; BaseRev = $first }
+
+            $r = Invoke-TestOpen @{ Request = @($plain, $nullBase, $noProp, $empty, $since); Label = 'worktree' }
+
+            ($r | ForEach-Object Action) | Should -Be @('opened', 'opened', 'opened', 'opened', 'opened')
+            foreach ($x in $r[0..2]) {
+                $x.FileCount | Should -Be 1 -Because "$($x.Repo) has no base and compares against HEAD"
+                $x.BaseRev   | Should -Be $head
+                Get-TestTree $x.BasePath | Should -Be @('b.txt')
+                Split-Path $x.HeadPath -Leaf | Should -Be "$($x.Repo) working"
+            }
+            $r[3].FileCount | Should -Be 3
+            $r[3].BaseRev   | Should -BeNullOrEmpty
+            Split-Path $r[3].BasePath -Leaf | Should -Be 'empty base empty'
+            Get-TestTree $r[3].BasePath | Should -Be @()
+            Get-TestTree $r[3].HeadPath | Should -Be @('a.txt', 'b.txt', 'c.txt')
+            $r[4].FileCount | Should -Be 2
+            $r[4].BaseRev   | Should -Be $first
+            Split-Path $r[4].BasePath -Leaf | Should -Be "since base $($first.Substring(0, 7))"
+            Get-TestTree $r[4].HeadPath | Should -Be @('b.txt', 'c.txt')
+        }
     }
 
     Describe 'Pure helpers' {

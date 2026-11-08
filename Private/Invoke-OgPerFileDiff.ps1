@@ -15,9 +15,12 @@ function Invoke-OgPerFileDiff {
         differs, or open nothing for one reported 'opened'):
 
           WorkingTree  (no argument)   the working tree vs the INDEX, tracked files only;
+                       <base>          the working tree vs the commit <base>, tracked files only
+                                       (-BaseRev without -HeadRev; Show-OgDiff -From -IncludeWorkingTree);
           Staged       --cached        the index vs HEAD;
           Range        <ref>...HEAD    HEAD vs the merge base (git resolves the three dots), or
-                       <base> <head>   two explicit commits (-BaseRev/-HeadRev; Show-OgDiff -Commit).
+                       <base> <head>   two explicit commits (-BaseRev/-HeadRev; Show-OgDiff -Commit,
+                                       -From/-To).
 
         The check is Get-OgPerFileDiffCount, which runs that `git diff` on a temporary copy of the index:
         a plain `git diff --quiet` rewrites .git/index (see there). It deliberately does NOT use the
@@ -45,9 +48,12 @@ function Invoke-OgPerFileDiff {
         -BaseRev and -HeadRev.
 
     .PARAMETER BaseRev
-        Range only: an explicit base commit; git diff and git difftool then get `<BaseRev> <HeadRev>` as
-        two arguments (Show-OgDiff -Commit's pinned old..new). Both must be non-empty: an empty side has
-        no per-file form in git difftool, so the caller reports such a repo itself.
+        Range: an explicit base commit; git diff and git difftool then get `<BaseRev> <HeadRev>` as two
+        arguments (Show-OgDiff -Commit's pinned old..new). Both must be non-empty: an empty side has no
+        per-file form in git difftool, so the caller reports such a repo itself.
+        WorkingTree (od task 10): the commit the working tree is compared with; git diff and git difftool
+        then get `<BaseRev>` as their one argument (Show-OgDiff -From -IncludeWorkingTree's pin at <A>).
+        Without it a WorkingTree compares against the index, as always.
 
     .PARAMETER HeadRev
         Range only, with -BaseRev: the explicit head commit.
@@ -60,8 +66,9 @@ function Invoke-OgPerFileDiff {
 
     .OUTPUTS
         One Og.DiffResult (New-OgDiffResult): 'opened', 'clean' or 'failed'. FileCount is the number of
-        paths git difftool walks; BaseRev is HEAD (-Staged), the merge base (-Range) or -BaseRev, HeadRev is
-        HEAD (-Range) or -HeadRev; both are $null where that side is the index or the working tree.
+        paths git difftool walks; BaseRev is HEAD (-Staged), the merge base (-Range) or -BaseRev (also for
+        a WorkingTree against a commit), HeadRev is HEAD (-Range) or -HeadRev; both are $null where that
+        side is the index or the working tree.
     #>
     [CmdletBinding()]
     param(
@@ -88,8 +95,17 @@ function Invoke-OgPerFileDiff {
     )
 
     $absPath  = $Repo.AbsolutePath
-    $explicit = -not [string]::IsNullOrEmpty($BaseRev) -or -not [string]::IsNullOrEmpty($HeadRev)
-    if ($explicit) {
+    # WorkingTree against a commit: `git diff <BaseRev>` / `git difftool <BaseRev>`, git's own form for
+    # "this commit vs the files on disk" (tracked files only, as every git difftool comparison).
+    $againstBase = $Kind -eq 'WorkingTree' -and -not [string]::IsNullOrEmpty($BaseRev)
+    $explicit = -not $againstBase -and (-not [string]::IsNullOrEmpty($BaseRev) -or -not [string]::IsNullOrEmpty($HeadRev))
+    if ($againstBase) {
+        if (-not [string]::IsNullOrEmpty($HeadRev) -or -not [string]::IsNullOrEmpty($Range)) {
+            throw 'Invoke-OgPerFileDiff -Kind WorkingTree takes -BaseRev alone: its head side is the working tree.'
+        }
+        # A leading '-' would reach git diff and git difftool as an OPTION; no commit id starts with one.
+        if ($BaseRev.StartsWith('-')) { throw "Invoke-OgPerFileDiff: invalid revision '$BaseRev'." }
+    } elseif ($explicit) {
         if ($Kind -ne 'Range' -or -not [string]::IsNullOrEmpty($Range)) {
             throw 'Invoke-OgPerFileDiff: -BaseRev/-HeadRev belong to -Kind Range, instead of -Range.'
         }
@@ -109,12 +125,14 @@ function Invoke-OgPerFileDiff {
     $compare = @(switch ($Kind) {
         'Range'  { if ($explicit) { $BaseRev; $HeadRev } else { $Range } }
         'Staged' { '--cached' }
-        default  { }
+        default  { if ($againstBase) { $BaseRev } }
     })
     $display = if ([string]::IsNullOrEmpty($Repo.Path)) { $Repo.Name } else { $Repo.Path }
 
     $common = @{ Repo = $Repo; Ref = $Ref; Range = $Range; Commit = $Commit }
-    if ($explicit) {
+    if ($againstBase) {
+        $common.BaseRev = $BaseRev
+    } elseif ($explicit) {
         $common.BaseRev = $BaseRev
         $common.HeadRev = $HeadRev
     } elseif ($Kind -ne 'WorkingTree') {
@@ -157,7 +175,8 @@ function Get-OgPerFileDiffCount {
         This is the -PerFile "is there a change?" check, and it is git's own comparison on purpose (the
         same `git diff` arguments git difftool gets), so it counts exactly the paths git difftool walks:
         the working tree vs the index with no argument, the index vs HEAD with --cached, a range with
-        '<ref>...HEAD'. Untracked files are never counted; a submodule entry is (git difftool shows it).
+        '<ref>...HEAD' or '<base> <head>', the working tree vs a commit with '<base>'. Untracked files are
+        never counted; a submodule entry is (git difftool shows it).
 
         WHY A COPY OF THE INDEX. MEASURED 2026-10-22 (git 2.50.1, od task 3 measurement M1): a plain
         `git diff --quiet` on a working tree with a stat-dirty file (touched, same content) REWRITES
@@ -169,7 +188,8 @@ function Get-OgPerFileDiffCount {
         The repo's top level (Resolve-OgRepoTree's AbsolutePath).
 
     .PARAMETER DiffArguments
-        The comparison arguments, as git difftool gets them: none, '--cached', or '<ref>...HEAD'.
+        The comparison arguments, as git difftool gets them: none, '--cached', '<ref>...HEAD',
+        '<base> <head>' or '<base>'.
 
     .OUTPUTS
         [int] the number of paths. Throws when git fails (e.g. a range that does not resolve).

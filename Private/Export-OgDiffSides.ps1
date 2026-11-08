@@ -38,6 +38,11 @@
 #     too long" (od review 3 hit it on a real repo). It is a command-line `-c`, never a config change: the
 #     repo stays read-only. The .NET and pwsh file calls here (copy, create, delete) need nothing: pwsh 7
 #     handles long paths by itself (same measurement).
+#   - A REVISION AGAINST THE WORKING TREE (-Kind WorkingTree -BaseRev, od task 9). The default WorkingTree
+#     base is HEAD; -BaseRev puts any commit (or '' = the empty tree) in HEAD's place and changes nothing
+#     else: the same index copy, the same refresh, diff-index against that commit, ls-files --others. It
+#     is NOT a Range with a working-tree head: the head side still comes from disk and the untracked
+#     files, and only an index (the copy) lets diff-index see the working tree at all.
 #   - NOTHING BUT EXPORTED FILES INSIDE A SIDE FOLDER (od task 7). The engine's marker, which makes a
 #     folder clearable, is a file BESIDE the side folder ('<side>.og-diff-side' in its parent), never in
 #     it: the diff tool shows a side folder's whole content, and the in-folder marker of tasks 1-6 was
@@ -57,15 +62,20 @@ function Get-OgDiffChange {
         result to Export-OgDiffSides -ChangeSet to export without listing twice).
 
         Comparisons (-Kind):
-          WorkingTree  base = HEAD, head = the working tree on disk, INCLUDING untracked files that
-                       are not ignored (each listed as Added with Untracked = $true).
+          WorkingTree  base = HEAD, or -BaseRev when given; head = the working tree on disk, INCLUDING
+                       untracked files that are not ignored (each listed as Added with Untracked = $true).
+                       With -BaseRev (od task 9) every difference between that revision and the disk is
+                       listed: what later commits changed, what is staged, what is only on disk, and the
+                       untracked files. An EMPTY -BaseRev means an empty base (the empty tree): every
+                       working-tree file is Added (a repo that did not exist at the range's start).
           Staged       base = HEAD, head = the index.
           Range        base = -BaseRev, head = -HeadRev, a two-dot tree comparison. An EMPTY rev
                        means an empty side (the empty tree), for a submodule added or removed by a
                        commit. A merge base, when wanted, is the caller's to resolve and pass.
 
         A repo with no commit yet (unborn HEAD) compares against the empty tree for WorkingTree and
-        Staged.
+        Staged. That fallback belongs to the DEFAULT base only: an explicit -BaseRev 'HEAD' in an unborn
+        repo does not resolve and throws, like any other revision that names no commit.
 
         With -GitDir (Range only) the comparison is read from that git dir alone, for a repo that has no
         work tree (a submodule removed by the commit being diffed): see the file header. RepoRoot is then
@@ -85,7 +95,9 @@ function Get-OgDiffChange {
         WorkingTree, Staged or Range.
 
     .PARAMETER BaseRev
-        Range only, and required for Range: the base revision, or '' for an empty base.
+        Range (required) and WorkingTree (optional, default HEAD): the base revision, which must resolve to
+        a commit present in the repo, or '' for an empty base. A revision starting with '-' is refused
+        (git would read it as an option). Not accepted for Staged.
 
     .PARAMETER HeadRev
         Range only, and required for Range: the head revision, or '' for an empty head.
@@ -106,6 +118,11 @@ function Get-OgDiffChange {
     .EXAMPLE
         (Get-OgDiffChange -WorkingDirectory C:\dev\proj -Kind WorkingTree).FileCount -gt 0
         # $true when the working tree differs from HEAD, untracked files included.
+
+    .EXAMPLE
+        Get-OgDiffChange -WorkingDirectory C:\dev\proj -Kind WorkingTree -BaseRev $pinAtA
+        # Everything between the commit $pinAtA and the files on disk (committed since, staged, unstaged,
+        # untracked). -BaseRev '' lists every working-tree file as Added.
     #>
     [CmdletBinding()]
     param(
@@ -126,13 +143,25 @@ function Get-OgDiffChange {
         [string] $GitDir
     )
 
-    $hasRevs = $PSBoundParameters.ContainsKey('BaseRev') -or $PSBoundParameters.ContainsKey('HeadRev')
-    if ($Kind -eq 'Range') {
-        if (-not ($PSBoundParameters.ContainsKey('BaseRev') -and $PSBoundParameters.ContainsKey('HeadRev'))) {
-            throw "Get-OgDiffChange -Kind Range needs both -BaseRev and -HeadRev ('' for an empty side)."
+    $hasBaseRev = $PSBoundParameters.ContainsKey('BaseRev')
+    $hasHeadRev = $PSBoundParameters.ContainsKey('HeadRev')
+    switch ($Kind) {
+        'Range' {
+            if (-not ($hasBaseRev -and $hasHeadRev)) {
+                throw "Get-OgDiffChange -Kind Range needs both -BaseRev and -HeadRev ('' for an empty side)."
+            }
         }
-    } elseif ($hasRevs) {
-        throw "Get-OgDiffChange -Kind $Kind compares against HEAD; -BaseRev/-HeadRev belong to -Kind Range."
+        'WorkingTree' {
+            if ($hasHeadRev) {
+                throw 'Get-OgDiffChange -Kind WorkingTree compares against the working tree; -HeadRev belongs to -Kind Range.'
+            }
+        }
+        'Staged' {
+            if ($hasBaseRev -or $hasHeadRev) {
+                throw 'Get-OgDiffChange -Kind Staged compares the index against HEAD; -BaseRev/-HeadRev belong to -Kind Range ' +
+                    '(and -BaseRev to -Kind WorkingTree).'
+            }
+        }
     }
     # Git-dir mode reads objects only. WorkingTree and Staged need a work tree and an index, which a git
     # dir without its work tree does not have (its index would describe a deleted folder).
@@ -152,6 +181,13 @@ function Get-OgDiffChange {
     if ($Kind -eq 'Range') {
         $base = Resolve-OgDiffSideRev -RepoRoot $repoRoot -Rev $BaseRev -EmptyTree $emptyTree -GitDir $GitDir
         $head = Resolve-OgDiffSideRev -RepoRoot $repoRoot -Rev $HeadRev -EmptyTree $emptyTree -GitDir $GitDir
+    } elseif ($hasBaseRev) {
+        # WorkingTree against an explicit base (od task 9): resolved exactly like a Range side ('' = the
+        # empty tree, a leading '-' refused, anything else must be a commit present here). No unborn-HEAD
+        # fallback on purpose: a caller that names a revision gets that revision or an error, never a
+        # silently empty base. The listing below is the default form's, with this base in HEAD's place.
+        $base = Resolve-OgDiffSideRev -RepoRoot $repoRoot -Rev $BaseRev -EmptyTree $emptyTree
+        $head = @{ Commit = $null; Tree = $null }
     } else {
         $headProbe = Invoke-OgGitPlumbing -WorkingDirectory $repoRoot `
             -Arguments 'rev-parse', '--verify', '--quiet', 'HEAD^{commit}'
@@ -195,6 +231,14 @@ function Get-OgDiffChange {
                 if ($refresh.ExitCode -ne 0) {
                     throw "git update-index --refresh (temp index) failed in '$repoRoot': $($refresh.StdErr)"
                 }
+                # $base.Tree is HEAD, or -BaseRev's commit (od task 9): diff-index compares any tree with
+                # the working tree THROUGH the index, so the same call serves both. A path that is in the
+                # base but not in the index (deleted by a later commit) is listed Deleted; one that is in
+                # the index but neither in the base nor on disk is not listed (MEASURED, od task 9 probe
+                # P1). Known, accepted limit (probe P2): git does not hash a file that differs from the
+                # INDEX, so a file whose disk content was put back to the base's while the index still
+                # differs is listed Modified with identical sides. It costs one "Identical" file, never a
+                # missed change; hashing every dirty file to drop it would read the whole dirty set.
                 $diffArgs = @('diff-index') + $diffOptions + @('--ignore-submodules=dirty', $base.Tree)
             }
             'Staged' {
@@ -268,7 +312,8 @@ function Export-OgDiffSides {
         only the changed entries (`update-index -z --index-info`, paths on stdin) and checking it out
         with `checkout-index -a -f --prefix=<destination>/`. That keeps the real index untouched, the
         content binary-exact, the path count unbounded and the eol conversion that of a real checkout.
-        The WorkingTree head side is copied from disk byte for byte.
+        The WorkingTree head side is copied from disk byte for byte, whatever its base (HEAD, a
+        -BaseRev, or the empty tree).
 
         Git-dir mode (-GitDir, or a -ChangeSet listed with -GitDir) exports a Range from the git dir alone,
         for a repo without a work tree; see the file header.
@@ -291,7 +336,8 @@ function Export-OgDiffSides {
         WorkingTree, Staged or Range; see Get-OgDiffChange.
 
     .PARAMETER BaseRev
-        Range only: the base revision, or '' for an empty base.
+        Range (required) and WorkingTree (optional, default HEAD): the base revision, or '' for an empty
+        base; see Get-OgDiffChange.
 
     .PARAMETER HeadRev
         Range only: the head revision, or '' for an empty head.
@@ -318,6 +364,11 @@ function Export-OgDiffSides {
     .EXAMPLE
         Export-OgDiffSides -WorkingDirectory C:\dev\proj -Kind Range -BaseRev $mergeBase -HeadRev HEAD `
             -BaseDestination "$env:TEMP\og-diff\x\base" -HeadDestination "$env:TEMP\og-diff\x\head"
+
+    .EXAMPLE
+        Export-OgDiffSides -WorkingDirectory C:\dev\proj -Kind WorkingTree -BaseRev $pinAtA `
+            -BaseDestination "$env:TEMP\og-diff\x\base" -HeadDestination "$env:TEMP\og-diff\x\working"
+        # The commit $pinAtA against the files on disk, untracked files included.
     #>
     [CmdletBinding(DefaultParameterSetName = 'Compare')]
     param(
@@ -511,8 +562,8 @@ function Get-OgDiffEmptyTree {
 function Resolve-OgDiffSideRev {
     <#
     .SYNOPSIS
-        Resolves one side of a Range comparison: an empty rev is the empty tree (no commit), anything
-        else must name a commit present in the repo.
+        Resolves one side of a Range comparison, or a WorkingTree -BaseRev: an empty rev is the empty
+        tree (no commit), anything else must name a commit present in the repo.
         -GitDir: git-dir mode (see the file header).
     .OUTPUTS
         Hashtable with Commit (full id or $null) and Tree (what diff-tree compares).
@@ -639,10 +690,12 @@ function Add-OgDiffUntrackedFile {
         core.excludesFile, so an ignored file never appears. A nested repo that is not a submodule is
         listed as 'dir/' and skipped: it is not a file of this repo.
 
-        A path can be untracked AND listed as Deleted: `git rm --cached` keeps the file on disk. That
-        is not a delete from the working tree's point of view, so the file is hashed with the repo's
-        clean conversion (`hash-object --stdin-paths`, paths on stdin) and compared with HEAD's blob:
-        identical -> dropped (nothing changed on disk), different -> Modified.
+        A path can be untracked AND listed as Deleted: `git rm --cached` keeps the file on disk, and
+        against an older -BaseRev (od task 9) a file deleted by a later commit may be back on disk,
+        untracked. Neither is a delete from the working tree's point of view, so the file is hashed with
+        the repo's clean conversion (`hash-object --stdin-paths`, paths on stdin) and compared with the
+        BASE's blob (HEAD's, or -BaseRev's): identical -> dropped (the disk matches the base),
+        different -> Modified.
     #>
     [CmdletBinding()]
     param(
@@ -660,7 +713,8 @@ function Add-OgDiffUntrackedFile {
         if ([string]::IsNullOrEmpty($path) -or $path.EndsWith('/')) { continue }
         $existing = $null
         if ($Files.TryGetValue($path, [ref] $existing)) {
-            # Only the `git rm --cached` shape reaches here: listed Deleted, yet on disk.
+            # Only the "listed Deleted, yet on disk" shape reaches here (`git rm --cached`, or a file a
+            # commit after -BaseRev deleted and that is back on disk).
             if ($existing.Status -eq 'Deleted' -and $existing.BaseMode -in '100644', '100755' -and
                 -not $path.Contains("`n")) {
                 $recheck.Add($path)

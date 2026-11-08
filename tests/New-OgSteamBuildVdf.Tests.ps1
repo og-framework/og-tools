@@ -314,3 +314,93 @@ Describe 'New-OgSteamBuildVdf' {
         }
     }
 }
+
+Describe 'New-OgSteamBuildVdf DepotPath and placeholder depots' {
+
+    BeforeEach {
+        $script:outDir = Join-Path $TestDrive ("steam out " + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $script:base = @{
+            AppId           = 1000
+            Description     = '20260926-120000-abc1234'
+            BuildOutput     = 'C:\Build Root\_steam\output'
+            OutputDirectory = $script:outDir
+        }
+    }
+
+    It 'maps a depot to its DepotPath, escaping a nested path, and keeps "." for the others' {
+        $splat = $script:base.Clone()
+        $splat.Depots = @(
+            $script:clientDepot
+            @{ DepotId = 1002; ContentRoot = 'C:\Build Root\server\WindowsServer'; DepotPath = 'Server'; FileExclusions = @('*.pdb', 'HostLogs\*') }
+            @{ DepotId = 1003; ContentRoot = 'C:\Build Root\tools'; DepotPath = 'Tools\Bin' }
+        )
+
+        $appPath = Invoke-Vdf $splat
+
+        $serverPath = Join-Path $script:outDir 'depot_build_1002.vdf'
+        Get-FileText $serverPath | Should -BeExactly (ConvertTo-Golden @'
+"DepotBuild"
+{
+|"DepotID"|"1002"
+|"ContentRoot"|"C:\\Build Root\\server\\WindowsServer"
+|"FileMapping"
+|{
+||"LocalPath"|"*"
+||"DepotPath"|"Server"
+||"recursive"|"1"
+|}
+|"FileExclusion"|"*.pdb"
+|"FileExclusion"|"HostLogs\\*"
+}
+'@)
+        Get-FileText (Join-Path $script:outDir 'depot_build_1003.vdf') | Should -Match "`t`t`"DepotPath`"`t`"Tools\\\\Bin`"`n"
+        Get-FileText (Join-Path $script:outDir 'depot_build_1001.vdf') | Should -Match "`t`t`"DepotPath`"`t`"\.`"`n"
+        Get-FileText $appPath | Should -Match ('"1002"\t"' + [regex]::Escape((ConvertTo-VdfLiteral $serverPath)) + '"')
+    }
+
+    It 'names placeholder depots that share DepotId 0 after their Name' {
+        $splat = $script:base.Clone()
+        $splat.AppId = 0
+        $splat.Depots = @(
+            @{ DepotId = 0; Name = 'game-client'; ContentRoot = 'C:\b\client' }
+            @{ DepotId = 0; Name = 'game-server'; ContentRoot = 'C:\b\server'; DepotPath = 'Server' }
+        )
+
+        $appPath = Invoke-Vdf $splat
+
+        $clientPath = Join-Path $script:outDir 'depot_build_0_game-client.vdf'
+        $serverPath = Join-Path $script:outDir 'depot_build_0_game-server.vdf'
+        @(Get-ChildItem -LiteralPath $script:outDir -File | ForEach-Object Name | Sort-Object) |
+            Should -Be @('app_build_0.vdf', 'depot_build_0_game-client.vdf', 'depot_build_0_game-server.vdf')
+        Get-FileText $appPath | Should -Match ("`t`t`"0`"`t`"" + [regex]::Escape((ConvertTo-VdfLiteral $clientPath)) + "`"`n`t`t`"0`"`t`"" + [regex]::Escape((ConvertTo-VdfLiteral $serverPath)) + '"')
+        Get-FileText $serverPath | Should -Match '"DepotPath"\t"Server"'
+    }
+
+    It 'keeps depot_build_0.vdf for a single placeholder depot, with or without a Name' {
+        $splat = $script:base.Clone()
+        $splat.Depots = @(@{ DepotId = 0; Name = 'game-client'; ContentRoot = 'C:\b\client' }, @{ DepotId = 7; Name = 'game-server'; ContentRoot = 'C:\b\server' })
+
+        Invoke-Vdf $splat | Out-Null
+
+        @(Get-ChildItem -LiteralPath $script:outDir -File | ForEach-Object Name | Sort-Object) |
+            Should -Be @('app_build_1000.vdf', 'depot_build_0.vdf', 'depot_build_7.vdf')
+    }
+
+    It 'rejects <Case> and writes nothing' -TestCases @(
+        @{ Case = 'two placeholder depots without names'; Depots = @(@{ DepotId = 0; ContentRoot = 'C:\a' }, @{ DepotId = 0; ContentRoot = 'C:\b' }); Message = '*Duplicate DepotId 0*distinct Name*' }
+        @{ Case = 'two placeholder depots, one unnamed'; Depots = @(@{ DepotId = 0; ContentRoot = 'C:\a' }, @{ DepotId = 0; Name = 'b'; ContentRoot = 'C:\b' }); Message = '*Duplicate DepotId 0*distinct Name*' }
+        @{ Case = 'two placeholder depots with the same name'; Depots = @(@{ DepotId = 0; Name = 'x'; ContentRoot = 'C:\a' }, @{ DepotId = 0; Name = 'x'; ContentRoot = 'C:\b' }); Message = '*Duplicate DepotId 0*distinct Name*' }
+        @{ Case = 'a real DepotId used twice, even with names'; Depots = @(@{ DepotId = 5; Name = 'a'; ContentRoot = 'C:\a' }, @{ DepotId = 5; Name = 'b'; ContentRoot = 'C:\b' }); Message = '*Duplicate DepotId 5*' }
+        @{ Case = 'a Name that is not file-name safe'; Depots = @(@{ DepotId = 0; Name = 'a\b'; ContentRoot = 'C:\a' }); Message = '*Depots`[0`].Name must match*' }
+        @{ Case = "DepotPath '..'"; Depots = @(@{ DepotId = 5; ContentRoot = 'C:\a'; DepotPath = '..' }); Message = "*Depots``[0``].DepotPath (DepotId 5) must be a relative folder*" }
+        @{ Case = 'a DepotPath with a .. segment'; Depots = @(@{ DepotId = 5; ContentRoot = 'C:\a'; DepotPath = 'a/../..' }); Message = '*DepotPath (DepotId 5) must be a relative folder*' }
+        @{ Case = 'a rooted DepotPath'; Depots = @(@{ DepotId = 5; ContentRoot = 'C:\a'; DepotPath = 'C:\Server' }); Message = '*DepotPath (DepotId 5) must be a relative folder*' }
+        @{ Case = 'a DepotPath with a wildcard'; Depots = @(@{ DepotId = 5; ContentRoot = 'C:\a'; DepotPath = 'Server\*' }); Message = '*DepotPath (DepotId 5) must be a relative folder*' }
+        @{ Case = 'an empty DepotPath'; Depots = @(@{ DepotId = 5; ContentRoot = 'C:\a'; DepotPath = '' }); Message = '*DepotPath (DepotId 5) must be a relative folder*' }
+    ) {
+        $splat = $script:base.Clone()
+        $splat.Depots = $Depots
+        { Invoke-Vdf $splat } | Should -Throw $Message
+        Test-Path -LiteralPath $script:outDir | Should -BeFalse
+    }
+}

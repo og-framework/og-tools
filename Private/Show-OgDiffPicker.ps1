@@ -10,7 +10,14 @@
 #   Format-OgPickerScreen      the PURE renderer: plain-text lines for a size and a state.
 #   Get-OgPickerScrollTop      the PURE viewport rule (keeps the selection visible at both edges).
 #   Select-OgPickerRow         the key loop; every console access goes through a one-line seam below.
-#   Invoke-OgDiffPicker        the dry-run entry point: lists, picks, returns the row, opens nothing.
+#   Get-OgPickerChoice         the PURE choice rule: a key (Enter, h, w), the selection and the mark ->
+#                              an Og.PickerChoice (one commit, a range, or a commit vs the working tree).
+#   Invoke-OgDiffPicker        the dry-run entry point: lists, picks, returns the choice, opens nothing.
+#
+# Ranges (od task 11a, R5): Space marks the selected row as one end of a range (one mark at a time); Enter
+# on another row then chooses the range between the two, the LOWER row (the older commit: the list is
+# newest first) as its base. `h` chooses selected..HEAD and `w` selected..the working tree. The picker only
+# CHOOSES: Show-OgDiff routes the Og.PickerChoice to -Commit or the range path.
 #
 # The picker never calls the commit-range resolver itself: the caller injects it as a scriptblock
 # (`-TouchResolver { param($sha) ... }`, returning Og.CommitRangeEntry objects). Rows are resolved
@@ -26,14 +33,22 @@ function Invoke-OgDiffPicker {
     <#
     .SYNOPSIS
         Dry-run entry point of the commit picker: shows the root's recent first-parent commits in the
-        console, lets the user pick one, and returns the picked row. Opens no diff and launches nothing.
+        console, lets the user choose one commit or a range, and returns the choice. Opens no diff and
+        launches nothing.
 
     .DESCRIPTION
         Lists the last -Count commits on the first-parent line of HEAD in -ProjectRoot (Get-OgPickerRows),
         then runs the key loop (Select-OgPickerRow):
           Up/Down, PgUp/PgDn, Home/End   move the selection
-          Enter                          returns the selected row (Og.PickerRow)
+          Space                          marks the selected row as one end of a range ('*'), or clears
+                                         the mark when the selected row is the marked one
+          Enter                          no mark: the selected commit (Kind Commit); with a mark: the range
+                                         between the marked and the selected row, the older (lower) row as
+                                         its base (Kind Range); on the marked row itself: nothing happens
+          h                              selected..HEAD (Kind Range, To 'HEAD')
+          w                              selected..the working tree (Kind WorkingTree)
           Esc or q                       returns nothing
+        The returned Og.PickerChoice is described under OUTPUTS (Get-OgPickerChoice builds it).
         The touched-repo column and the detail line come from -TouchResolver, called lazily for the
         visible rows only and at most once per commit. Without a resolver they show an ellipsis.
 
@@ -62,7 +77,8 @@ function Invoke-OgDiffPicker {
         defaults to Format-OgPickerTouchSummary ('root +3').
 
     .OUTPUTS
-        Og.PickerRow (Sha, ShortSha, Date, Subject, Touched, Entries, TouchError), or nothing on cancel.
+        Og.PickerChoice (Kind, Commit, From, To, WorkingTree, Sha, Row; see Get-OgPickerChoice), or nothing
+        on cancel.
 
     .EXAMPLE
         & (Get-Module og-framework) {
@@ -72,6 +88,8 @@ function Invoke-OgDiffPicker {
             }
         }
         # A trivial resolver until the real one is wired in: every commit shows 'root'.
+        # Mark a row with Space, move to another and press Enter: the result is
+        # Kind Range, From <the older row's sha>, To <the newer row's sha>.
     #>
     [CmdletBinding()]
     param(
@@ -500,13 +518,15 @@ function Format-OgPickerScreen {
 
     .DESCRIPTION
         Returns exactly -Height lines (at least one), none longer than -Width:
-          header    'Pick a commit: <title>  (<selected>/<count>)'
-          rows      '> <sha>  <date>  <touched>  <subject>'; '> ' marks the selected row, '  ' the others;
-                    an unresolved touched column shows an ellipsis; the line is cut to the width with an
+          header    'Pick a commit: <title>  (<selected>/<count>)', plus '  base: <short sha>' while a row
+                    is marked (the base Enter would use: the OLDER of the marked and the selected row)
+          rows      '><sha>  <date>  <touched>  <subject>' where the first two characters are the marker
+                    columns: '>' (or ' ') for the selected row, then '*' (or ' ') for the marked row; an
+                    unresolved touched column shows an ellipsis; the line is cut to the width with an
                     ellipsis, so it is the subject (the last column) that gets truncated
           (blank)   below the last row when the list is shorter than the viewport
-          detail    the selected row's repos and ranges (Format-OgPickerDetail)
-          footer    the keys
+          detail    the selected row's repos and ranges (Format-OgPickerDetail), whatever is marked
+          footer    the keys (Get-OgPickerFooter)
         The rows shown are Top .. Top + viewport - 1; the caller keeps Top consistent with the selection
         (Get-OgPickerScrollTop). The colours (the selected row in inverse video) are added only by the
         drawing seam, so the output of this function compares as plain text.
@@ -528,6 +548,9 @@ function Format-OgPickerScreen {
 
     .PARAMETER Title
         The header's title (the project folder's name).
+
+    .PARAMETER Marked
+        The marked row's index, or -1 (the default) when no row is marked.
     #>
     [CmdletBinding()]
     param(
@@ -539,7 +562,9 @@ function Format-OgPickerScreen {
         [Parameter(Mandatory)] [int] $Width,
         [Parameter(Mandatory)] [int] $Height,
 
-        [string] $Title = ''
+        [string] $Title = '',
+
+        [int] $Marked = -1
     )
 
     $layout   = Get-OgPickerLayout -Height $Height
@@ -548,14 +573,26 @@ function Format-OgPickerScreen {
     $shaWidth = 7
     foreach ($row in $Rows) { $shaWidth = [Math]::Max($shaWidth, ([string] $row.ShortSha).Length) }
 
+    $hasMark = $Marked -ge 0 -and $Marked -lt $Rows.Count
     $lines = [System.Collections.Generic.List[string]]::new()
     if ($layout.Header) {
-        $lines.Add((ConvertTo-OgPickerFitted "Pick a commit: $Title  ($($Selected + 1)/$($Rows.Count))" $Width))
+        $header = "Pick a commit: $Title  ($($Selected + 1)/$($Rows.Count))"
+        if ($hasMark) {
+            # The base Enter WOULD use, not simply the marked row: when the selection moves below the mark
+            # (to an older commit), the selected row becomes the base and the marked row the head, and a
+            # header that kept naming the mark would announce the wrong base.
+            $baseIndex = if ($Selected -ge 0 -and $Selected -lt $Rows.Count) { [Math]::Max($Marked, $Selected) } else { $Marked }
+            $header += "  base: $([string] $Rows[$baseIndex].ShortSha)"
+        }
+        $lines.Add((ConvertTo-OgPickerFitted $header $Width))
     }
     for ($i = $Top; $i -lt $Top + $layout.ViewportHeight; $i++) {
         if ($i -lt 0 -or $i -ge $Rows.Count) { $lines.Add(''); continue }
         $row     = $Rows[$i]
-        $marker  = if ($i -eq $Selected) { '> ' } else { '  ' }
+        # Two one-character marker columns, selection then mark, in the two characters the selection marker
+        # '> ' always took. Keep them two wide: the touched column's offset (29) is pinned by the 5a and 5b
+        # tests and read by the -Pick tests in Show-OgDiff.Tests.ps1; a third column would shift every column.
+        $marker  = $(if ($i -eq $Selected) { '>' } else { ' ' }) + $(if ($i -eq $Marked) { '*' } else { ' ' })
         $touched = if ($null -eq $row.Touched) { $ellipsis } else { [string] $row.Touched }
         $touched = (ConvertTo-OgPickerFitted $touched $touchWidth).PadRight($touchWidth)
         $line    = $marker + ([string] $row.ShortSha).PadRight($shaWidth) + '  ' + $row.Date + '  ' + $touched + '  ' + $row.Subject
@@ -566,9 +603,35 @@ function Format-OgPickerScreen {
         $lines.Add((ConvertTo-OgPickerFitted ('  ' + $detail) $Width))
     }
     if ($layout.Footer) {
-        $lines.Add((ConvertTo-OgPickerFitted 'Up/Down PgUp/PgDn Home/End: move   Enter: open   Esc/q: cancel' $Width))
+        $lines.Add((Get-OgPickerFooter -Width $Width))
     }
     $lines.ToArray()
+}
+
+function Get-OgPickerFooter {
+    <#
+    .SYNOPSIS
+        The footer line: the keys, in full when they fit the width, else in a compact form, cut with an
+        ellipsis only when even that does not fit.
+
+    .DESCRIPTION
+        Full:    'Space: mark  Enter: open  h: vs HEAD  w: vs working tree  Esc/q: cancel' (71 characters)
+        Compact: 'Space:mark Enter:open h:HEAD w:worktree Esc/q:cancel' (52 characters)
+        The move keys (arrows, PgUp/PgDn, Home/End) are not listed: they do what they say, and the five
+        keys above would not fit an 80-column window next to them.
+
+    .PARAMETER Width
+        The usable width in characters.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [int] $Width
+    )
+
+    $full    = 'Space: mark  Enter: open  h: vs HEAD  w: vs working tree  Esc/q: cancel'
+    $compact = 'Space:mark Enter:open h:HEAD w:worktree Esc/q:cancel'
+    if ($full.Length -le $Width) { return $full }
+    ConvertTo-OgPickerFitted $compact $Width
 }
 
 function Format-OgPickerFrame {
@@ -620,8 +683,12 @@ function Format-OgPickerFrame {
 function Get-OgPickerKeyAction {
     <#
     .SYNOPSIS
-        Maps a key to a picker action: Up, Down, PageUp, PageDown, Home, End, Pick (Enter), Cancel (Esc, q)
-        or None (any other key).
+        Maps a key to a picker action: Up, Down, PageUp, PageDown, Home, End, Pick (Enter), Cancel (Esc, q),
+        Mark (Space), VsHead (h), VsWorkingTree (w) or None (any other key).
+
+    .DESCRIPTION
+        The letters are matched on the typed character, either case, like q: a Caps Lock left on must
+        not turn h into an ignored key.
 
     .PARAMETER Key
         The pressed key.
@@ -640,9 +707,98 @@ function Get-OgPickerKeyAction {
         ([System.ConsoleKey]::End)       { return 'End' }
         ([System.ConsoleKey]::Enter)     { return 'Pick' }
         ([System.ConsoleKey]::Escape)    { return 'Cancel' }
+        ([System.ConsoleKey]::Spacebar)  { return 'Mark' }
     }
+    # -eq on [char] is case-sensitive, hence both cases spelled out.
     if ($Key.KeyChar -eq [char] 'q' -or $Key.KeyChar -eq [char] 'Q') { return 'Cancel' }
+    if ($Key.KeyChar -eq [char] 'h' -or $Key.KeyChar -eq [char] 'H') { return 'VsHead' }
+    if ($Key.KeyChar -eq [char] 'w' -or $Key.KeyChar -eq [char] 'W') { return 'VsWorkingTree' }
     'None'
+}
+
+function Get-OgPickerChoice {
+    <#
+    .SYNOPSIS
+        The PURE choice rule: what an Enter, h or w key chooses for a selection and a mark, as an
+        Og.PickerChoice, or nothing when the key does nothing (Enter on the marked row itself).
+
+    .DESCRIPTION
+        Rows are newest first, so a LOWER row (a higher index) is an OLDER commit.
+          Pick (Enter), no mark          Kind Commit: Commit = the selected row's sha
+          Pick (Enter), a mark           Kind Range: From = the older of the marked and the selected row,
+                                         To = the newer one, whichever of the two was marked
+          Pick on the marked row         nothing (a range from a commit to itself is empty)
+          VsHead (h)                     Kind Range: From = the selected row, To = 'HEAD' (the literal
+                                         revision; the mark is ignored)
+          VsWorkingTree (w)              Kind WorkingTree: From = the selected row, WorkingTree = $true
+                                         (the mark is ignored)
+        Every other action gives nothing.
+
+        Every choice carries: Kind; Commit (full sha, Kind Commit only, else $null); From and To (full
+        shas, To 'HEAD' for h, To $null for WorkingTree; both $null for Commit); WorkingTree (bool); Row
+        (the Og.PickerRow the key was pressed on); and Sha (= Commit, $null for the other kinds).
+
+        Sha exists for the single-commit caller from od task 5b: Show-OgDiff -Pick reads `$picked.Sha`,
+        and on a Commit choice it is exactly the picked row's Sha, as when the picker returned the row.
+        Do not drop it before Show-OgDiff routes on Kind (od task 11b), and never fill it for a Range or
+        WorkingTree choice: a non-null Sha there would send a range down the single-commit path.
+
+    .PARAMETER Rows
+        Og.PickerRow objects, newest first.
+
+    .PARAMETER Action
+        The key's action (Get-OgPickerKeyAction).
+
+    .PARAMETER Selected
+        The selected row's index.
+
+    .PARAMETER Marked
+        The marked row's index, or -1 (the default) when no row is marked.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]] $Rows,
+
+        [Parameter(Mandatory)] [string] $Action,
+        [Parameter(Mandatory)] [int] $Selected,
+
+        [int] $Marked = -1
+    )
+
+    if ($Selected -lt 0 -or $Selected -ge $Rows.Count) { return }
+    $row     = $Rows[$Selected]
+    $hasMark = $Marked -ge 0 -and $Marked -lt $Rows.Count
+
+    $kind = $null; $commit = $null; $from = $null; $to = $null
+    switch ($Action) {
+        'Pick' {
+            if (-not $hasMark) {
+                $kind = 'Commit'; $commit = [string] $row.Sha
+            } elseif ($Marked -ne $Selected) {
+                # The higher index is the older commit and therefore the base, regardless of which end was
+                # marked first: marking the newer row and moving down must give the same range as the reverse.
+                $kind = 'Range'
+                $from = [string] $Rows[[Math]::Max($Marked, $Selected)].Sha
+                $to   = [string] $Rows[[Math]::Min($Marked, $Selected)].Sha
+            }
+        }
+        'VsHead'        { $kind = 'Range'; $from = [string] $row.Sha; $to = 'HEAD' }
+        'VsWorkingTree' { $kind = 'WorkingTree'; $from = [string] $row.Sha }
+    }
+    if ($null -eq $kind) { return }
+
+    [PSCustomObject]@{
+        PSTypeName  = 'Og.PickerChoice'
+        Kind        = $kind
+        Commit      = $commit
+        From        = $from
+        To          = $to
+        WorkingTree = $kind -eq 'WorkingTree'
+        Sha         = $commit
+        Row         = $row
+    }
 }
 
 function Get-OgPickerNextSelection {
@@ -687,10 +843,14 @@ function Get-OgPickerNextSelection {
 function Select-OgPickerRow {
     <#
     .SYNOPSIS
-        The picker's key loop: draws the model, moves the selection on Up/Down, PgUp/PgDn, Home/End, and
-        returns the selected row on Enter, or nothing on Esc or q.
+        The picker's key loop: draws the model, moves the selection on Up/Down, PgUp/PgDn, Home/End, keeps
+        a mark on Space, and returns an Og.PickerChoice on Enter, h or w, or nothing on Esc or q.
 
     .DESCRIPTION
+        Space marks the selected row, moves the mark there from another row (one mark at a time), or clears
+        it when pressed on the marked row. Enter, h and w end the loop with Get-OgPickerChoice's choice;
+        Enter on the marked row chooses nothing and the loop goes on (the screen stays as it is).
+
         Each turn of the loop re-reads the window size (a resize between two keys redraws at the new size,
         with the selection kept visible), renders, draws, and then EITHER resolves one more visible row
         (when no key is waiting) OR reads one key. So the rows appear with an ellipsis first and fill in
@@ -701,14 +861,14 @@ function Select-OgPickerRow {
           Enter-OgPickerScreen / Exit-OgPickerScreen   alternate screen, cursor
           Get-OgPickerWindowSize   Write-OgPickerScreen   Test-OgPickerKeyAvailable   Read-OgPickerKey
         Exit-OgPickerScreen runs in `finally`: the cursor and the colours come back after Enter, Esc, an
-        exception or Ctrl+C alike. Nothing is written to the pipeline inside the loop: the picked row is
+        exception or Ctrl+C alike. Nothing is written to the pipeline inside the loop: the choice is
         emitted only after the screen is restored, so it (and anything downstream) lands on the user's screen.
 
     .PARAMETER Model
         Og.PickerModel (New-OgPickerModel).
 
     .OUTPUTS
-        The selected Og.PickerRow, or nothing (cancelled, or no rows).
+        Og.PickerChoice (Get-OgPickerChoice), or nothing (cancelled, or no rows).
     #>
     [CmdletBinding()]
     param(
@@ -723,6 +883,7 @@ function Select-OgPickerRow {
 
     $selected = 0
     $top      = 0
+    $marked   = -1
     $picked   = $null
     $screen   = Enter-OgPickerScreen
     try {
@@ -735,7 +896,8 @@ function Select-OgPickerRow {
             $layout = Get-OgPickerLayout -Height $height
             $top    = Get-OgPickerScrollTop -Selected $selected -Top $top -ViewportHeight $layout.ViewportHeight -Count $count
 
-            $lines = @(Format-OgPickerScreen -Rows $rows -Selected $selected -Top $top -Width $width -Height $height -Title $Model.Title)
+            $lines = @(Format-OgPickerScreen -Rows $rows -Selected $selected -Top $top -Width $width -Height $height `
+                -Title $Model.Title -Marked $marked)
             Write-OgPickerScreen -Lines $lines -Highlight ($layout.RowOffset + $selected - $top) -Width $width
 
             $pending = Get-OgPickerPendingIndex -Model $Model -Selected $selected -Top $top -ViewportHeight $layout.ViewportHeight
@@ -745,8 +907,18 @@ function Select-OgPickerRow {
             }
 
             $action = Get-OgPickerKeyAction -Key (Read-OgPickerKey)
-            if ($action -eq 'Pick')   { $picked = $rows[$selected]; break }
             if ($action -eq 'Cancel') { break }
+            if ($action -eq 'Mark') {
+                $marked = if ($marked -eq $selected) { -1 } else { $selected }
+                continue
+            }
+            if ($action -in 'Pick', 'VsHead', 'VsWorkingTree') {
+                # Kept in $picked and emitted after the finally (see below). No choice (Enter on the marked
+                # row) is a no-op: the loop simply goes on.
+                $picked = Get-OgPickerChoice -Rows $rows -Action $action -Selected $selected -Marked $marked
+                if ($null -ne $picked) { break }
+                continue
+            }
             $selected = Get-OgPickerNextSelection -Action $action -Selected $selected `
                 -ViewportHeight $layout.ViewportHeight -Count $count
         }
@@ -754,8 +926,8 @@ function Select-OgPickerRow {
         Exit-OgPickerScreen -State $screen
     }
 
-    # Emit the row only HERE, after the finally. Never `return $row` inside the try: PowerShell writes a returned
-    # object downstream at once and runs the finally afterwards, so Out-Default would print the row onto the
+    # Emit the choice only HERE, after the finally. Never `return $choice` inside the try: PowerShell writes a
+    # returned object downstream at once and runs the finally afterwards, so Out-Default would print it onto the
     # alternate screen (which the exit then discards) and a downstream command would run on that screen too.
     if ($null -ne $picked) { $picked }
 }

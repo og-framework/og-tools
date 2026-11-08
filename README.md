@@ -78,7 +78,7 @@ Get-Command -Module og-framework | Select-Object Name, CommandType
 | Cmdlet | Alias | Purpose |
 |--------|-------|---------|
 | `Get-OgRepoStatus` | `oggitstatus` | Read tree state (PSObjects per repo) |
-| `Show-OgDiff` | `oggitdiff` | Open what changed across the tree in the diff tool: one directory-diff tab per changed repo in one window; `-Staged`, `-Against`, `-Commit`, `-Pick`, `-PerFile` ([reviewing changes](#reviewing-changes-with-oggitdiff)) |
+| `Show-OgDiff` | `oggitdiff` | Open what changed across the tree in the diff tool: one directory-diff tab per changed repo in one window; `-Staged`, `-Against`, `-Commit`, `-Pick`, `-From`, `-PerFile` ([reviewing changes](#reviewing-changes-with-oggitdiff)) |
 | `Sync-OgFramework` | `oggitsync` | Fetch + ff-merge cascade deepest-first; initialises new submodules; `-Branch` syncs a feature branch instead of main |
 | `Add-OgChange` | `oggitadd` | Stage changes across the tree; skips (with a warning) nested repos not declared in `.gitmodules` |
 | `New-OgCommit` | `oggitcommit` | Commit + auto pin-advance cascade |
@@ -196,8 +196,11 @@ oggitdiff -Staged                       # the index vs HEAD: what you are about 
 oggitdiff -Against origin/main          # HEAD vs its merge base with origin/main (<ref>...HEAD)
 oggitdiff -Against origin/main -Fetch   # the same, after git fetch --recurse-submodules
 oggitdiff -Commit 6245add               # what one oggitcommit run (root commit 6245add) changed, every repo
-oggitdiff -Pick                         # pick that root commit from a list of the last 30
+oggitdiff -Pick                         # pick that root commit from a list of the last 30 (or a range: see below)
 oggitdiff -Pick -Count 50
+oggitdiff -From 758fb77 -To 07414fb     # every repo between two root commits (two-dot: pin at A..pin at B)
+oggitdiff -From 758fb77                 # the same up to HEAD
+oggitdiff -From 758fb77 -IncludeWorkingTree   # root commit 758fb77 against the working tree, uncommitted work included
 oggitdiff -PerFile                      # git difftool's per-file windows instead (with any mode above)
 oggitdiff -Tool meld                    # another git-configured tool for this call
 ```
@@ -210,7 +213,9 @@ oggitdiff -Tool meld                    # another git-configured tool for this c
 | `-Staged` | HEAD | the index |
 | `-Against <ref>` | `git merge-base <ref> HEAD`, never `<ref>`'s tip | HEAD |
 | `-Commit <rev>` | each touched repo's old pin | its new pin |
-| `-Pick [-Count <n>]` | as `-Commit`, for the picked commit | |
+| `-Pick [-Count <n>]` | as `-Commit` for a picked commit, as `-From` for a picked range (Space + Enter, `h`, `w`) | |
+| `-From <A> [-To <B>]` | each repo's pin at `<A>` | its pin at `<B>` (default HEAD) |
+| `-From <A> -IncludeWorkingTree` | each repo's pin at `<A>` | its working tree, including untracked files that are not ignored |
 
 - **`-Against`** is the three-dot range on purpose: only what your branch added since the branch point, not
   what `<ref>` gained since. A repo where `<ref>` does not resolve is `no-ref` and skipped; one without a
@@ -222,19 +227,49 @@ oggitdiff -Tool meld                    # another git-configured tool for this c
   files. Each submodule whose pin the commit moved is diffed from its old pin to its new pin, exactly those
   two gitlink ids (never its current HEAD), and nested submodules through the pin changes inside that range.
   Only the repos the commit touched get a result. The run is labelled `commit-<short sha>`.
+- **`-From <A> [-To <B>]`**: a range between two root commits; both name commits in the project root and
+  `-To` defaults to HEAD. Every repo either commit reaches through its submodule pins is paired by its
+  og-tree path; each repo whose pin differs is diffed from its pin at `<A>` to its pin at `<B>` (nested pins
+  read from their parent's *pinned* commit, never a current HEAD or tip). The root is `<A>..<B>`, shown only
+  if root files differ. **Two-dot, never a merge base:** the two trees are compared as they are, so two
+  unrelated commits (no common history) work like any other pair, and what `<B>` lacks of `<A>` shows as
+  deleted. A repo pinned at the same commit at both ends gets no result; a submodule that only one end has
+  gets an empty side (added / removed, as under `-Commit`); a pin missing locally is `missing-commit`. One
+  cascade is the special case: `-From X^1 -To X` gives exactly the results of `-Commit X` (apart from `Commit`
+  and the run folder). The run is labelled `range-<A short>-<B short>`. Two ends that name the same commit
+  (e.g. `-From HEAD`, or `h` on the picker's top row) print one warning, `Nothing between <A short> and
+  <B short>` (`... and HEAD` when `-To` is `HEAD` or left out), and open nothing.
+- **`-From <A> -IncludeWorkingTree`** (instead of `-To`): root commit `<A>` against the working tree. Every
+  repo of the tree as it is checked out now is compared from its pin at `<A>` to the files on disk: commits
+  since `<A>`, staged and unstaged changes and untracked files, all at once. Every checked-out repo of the
+  tree gets a result (`clean` when nothing differs), plus one per repo only `<A>` has, and the missing-commit
+  exception below. A repo `<A>` does not contain has an empty base (every file added);
+  a repo `<A>` pins that the tree no longer has is diffed to an empty head; a pin missing at `<A>` is
+  `missing-commit`, and so is every repo below it (its pin at `<A>` is unknown; `Error` names the repo above
+  it). A repo that is not checked out is skipped, as in the default mode, with one exception (a submodule
+  whose parent keeps no git dir is `missing-commit`: see
+  [Submodules that are not checked out](#what-a-diff-contains)). The run is labelled
+  `range-<A short>-working`. `-To` and `-IncludeWorkingTree` together are a parameter-binding error.
 - **`-PerFile`** keeps `git difftool --no-prompt` per repo (`--cached` for `-Staged`, `<ref>...HEAD` for
-  `-Against`, `<old> <new>` per repo for `-Commit`/`-Pick`, `--tool=<Tool>` with `-Tool`): one window per
-  changed file, temp files managed by git. See [-PerFile](#-perfile).
+  `-Against`, `<old> <new>` per repo for `-Commit`, `<pin at A> <pin at B>` (or `<pin at A>` alone with
+  `-IncludeWorkingTree`) for `-From`, and for `-Pick` as the command it stands for; `--tool=<Tool>` with
+  `-Tool`): one window per changed file, temp files managed by git. See [-PerFile](#-perfile).
 - **`-DirDiff`** is accepted and ignored: directory diffs are the default, and `git difftool --dir-diff` is
   never used (below).
-- `-Staged`, `-Against`, `-Commit` and `-Pick` are mutually exclusive.
+- `-Staged`, `-Against`, `-Commit`, `-Pick` and `-From` are mutually exclusive. `-From` and `-To` take
+  any revision that names a commit in the project root; an option-like value (a leading `-`) or one that
+  names no commit is an error before anything is listed.
 
 ### Results
 
 One `Og.DiffResult` per repo, in tree order: `Repo`, `Path`, `Action`, `Error`, `Ref`, `Range`, `BasePath`,
 `HeadPath`, `Commit`, `BaseRev`, `HeadRev`, `FileCount`, `RunPath`. The default table shows `Repo`,
-`Action`, `Files` (= `FileCount`, the number of changed files) and `Error`. With `-Commit`/`-Pick` only the
-touched repos are listed; a cancelled `-Pick` returns nothing. `Get-Help Show-OgDiff -Full` has every field.
+`Action`, `Files` (= `FileCount`, the number of changed files) and `Error`. With `-Commit` only the
+touched repos are listed, with `-From -To` only the repos whose pin differs, with `-From -IncludeWorkingTree`
+every checked-out repo of the tree (plus one per repo only `<A>` has, and the missing-commit exception in
+[Modes](#modes)); `-Pick` lists what the command its choice stands for lists, and nothing when
+cancelled. `Commit` is set only by `-Commit` and a single picked commit (a range has no one root commit;
+`BaseRev`/`HeadRev` are each repo's two sides). `Get-Help Show-OgDiff -Full` has every field.
 
 | Action | Meaning |
 |---|---|
@@ -242,7 +277,7 @@ touched repos are listed; a cancelled `-Pick` returns nothing. `Get-Help Show-Og
 | `clean` | nothing to show (`Files` 0), no tab |
 | `failed` | the listing, export or launch failed, or no diff tool is configured; `Error` says why. `BasePath`/`HeadPath`/`RunPath` are set when the export worked, so you can open the folders by hand |
 | `no-ref` | `-Against`: `<ref>` does not resolve in that repo |
-| `missing-commit` | `-Commit`/`-Pick`: a pin commit is not present locally (never fetched), or the submodule's objects are nowhere here (never initialised, or removed together with its git dir, as `oggitsubrm` does). A warning, never fatal: the other repos still open |
+| `missing-commit` | `-Commit`/`-Pick`/`-From`: a pin commit is not present locally (never fetched), or the submodule's objects are nowhere here (never initialised, or removed together with its git dir, as `oggitsubrm` does), or with `-From -IncludeWorkingTree` a repo below one whose pin at `<A>` is missing (its pin there is unknown). A warning, never fatal: the other repos still open |
 
 ### What a diff contains
 
@@ -255,10 +290,17 @@ touched repos are listed; a cancelled `-Pick` returns nothing. `Get-Help Show-Og
   it is a repo of its own, with its own tab. Under `-Commit`, a submodule whose only change is moved pins of
   its own submodules has no changed file: it is `clean`, with no tab (its nested repos have their own
   results). Under `-PerFile` it is `opened`, because git difftool shows the moved pin itself.
-- **Removed or deinit-ed submodules** (`-Commit`): a submodule the commit removed, or one without a work tree
-  here, is still diffed, from the git dir its parent kept (`.git/modules/<name>`); a removed one's head side
-  is empty, an added one's base side. Only when that git dir is gone too (after `oggitsubrm`) is it
-  `missing-commit`.
+- **Submodules that are not checked out** (the default mode, `-Staged`, `-Against`, and `-PerFile` with them):
+  a submodule whose folder is missing, or is an empty folder that is not its own work tree (never
+  initialised, e.g. after a clone without `--recurse-submodules`, or deinit-ed), is skipped with no result
+  (`-Verbose` names an empty folder it skipped). git run in such a folder would reach the PARENT repo and
+  diff it a second time. `-From -IncludeWorkingTree` skips it too, unless `<A>` pins it and its parent keeps
+  no git dir for it: then its pin at `<A>` cannot be checked here and it is `missing-commit`. `-Commit` and
+  `-From -To` read such a submodule's commits from the git dir its parent kept (next item).
+- **Removed or deinit-ed submodules** (`-Commit`, `-From -To`): a submodule the commit (or the range)
+  removed, or one without a work tree here, is still diffed, from the git dir its parent kept
+  (`.git/modules/<name>`); a removed one's head side is empty, an added one's base side. Only when that git
+  dir is gone too (after `oggitsubrm`, or never created in this clone) is it `missing-commit`.
 - **Read-only, with two exceptions.** The directory diffs (every mode without `-PerFile`) never write to a
   repo: no index, ref or config change. Their listing and export run on a temporary copy of the index,
   because a plain `git diff` rewrites `.git/index` when files are only stat-dirty (measured, even with
@@ -274,7 +316,8 @@ Every call that opens anything creates a new run folder:
 %TEMP%\og-diff\<yyyyMMdd-HHmmss>-<label>\<repo>\<side>
 ```
 
-- `<label>`: `worktree`, `staged`, `against-<ref>` or `commit-<short sha>`, made filesystem-safe
+- `<label>`: `worktree`, `staged`, `against-<ref>`, `commit-<short sha>`, `range-<A short>-<B short>` or
+  `range-<A short>-working`, made filesystem-safe
   (`origin/main` becomes `origin-main`) and cut to 24 characters. A second run in the same second gets
   `-2`, `-3`, ...
 - `<repo>`: the repo's folder name, or its og-tree path made safe when two touched repos share a name.
@@ -348,14 +391,21 @@ still shows them and the panes go empty. Hence the persistent run folders above.
   **index** (not HEAD) and ignores untracked files: a repo whose only change is staged, or untracked, is
   `clean` and opens nothing (use the default mode, or `-Staged`). git difftool itself is git's interactive
   command and may refresh the index's stat information, as any `git diff` does.
-- Under `-Commit`/`-Pick` some repos have no per-file form and report `failed` with a hint to the directory
-  mode (`oggitdiff -Commit <sha>`): a submodule the commit added or removed (an empty side), a root commit
-  without a parent, and a repo without a work tree here (present only in its parent's `modules/`).
+- Under `-Commit` (and a single commit picked with `-Pick`) some repos have no per-file form and report
+  `failed` with a hint to the directory mode (`oggitdiff -Commit <sha>`): a submodule the commit added or
+  removed (an empty side), a root commit without a parent, and a repo without a work tree here (present only
+  in its parent's `modules/`).
+- Under `-From` (and a range picked with `-Pick`) each repo runs `git difftool --no-prompt <pin at A> <pin at B>`,
+  or with `-IncludeWorkingTree` `git difftool --no-prompt <pin at A>` (its working tree against that commit:
+  tracked files only, so an untracked file is not shown, unlike the directory mode). A repo only one end
+  contains (an empty side) or without a work tree here reports `failed` with a hint to the directory mode
+  (`oggitdiff -From <A> -To <B>` or `oggitdiff -From <A> -IncludeWorkingTree`).
 
 ### The commit picker (`-Pick`)
 
 `oggitdiff -Pick` lists the project root's last `-Count` commits (default 30) on the first-parent line of
-HEAD, newest first, one line each, then opens the picked one exactly as `oggitdiff -Commit <its sha>`:
+HEAD, newest first, one line each, then opens the picked one exactly as `oggitdiff -Commit <its sha>`, or a
+picked range exactly as the `oggitdiff -From` command it stands for:
 
 ```text
 > 6245add  2026-10-21 23:29  root +5       Split the game-agnostic half of ...
@@ -366,8 +416,20 @@ The columns are the short sha, the author date (local time), the repos the commi
 | Key | Action |
 |---|---|
 | Up / Down, PgUp / PgDn, Home / End | move the selection |
-| Enter | open the selected commit |
+| Space | mark the selected row as one end of a range (`*` after the selection marker); Space on the marked row clears the mark, on another row moves it (one mark at a time) |
+| Enter | no mark: open the selected commit (`oggitdiff -Commit <sha>`); with a mark: open the range between the marked and the selected row, the **older** (lower) row as the base, whichever was marked first (`oggitdiff -From <older> -To <newer>`); on the marked row itself: nothing, the picker stays open |
+| h | open the selected row to HEAD (`oggitdiff -From <sha> -To HEAD`) |
+| w | open the selected row to the working tree, uncommitted and untracked work included (`oggitdiff -From <sha> -IncludeWorkingTree`) |
 | Esc or q | cancel: nothing is opened and nothing is returned |
+
+- While a row is marked, the header ends in `base: <short sha>`: the base **Enter** would use from the
+  current selection (the older of the marked and the selected row; on the marked row, where Enter does
+  nothing, the mark itself). `h` and `w` ignore the mark and always start at the selected row, so `base:`
+  does not name their base.
+- `h` on the top row (HEAD itself) compares HEAD with HEAD: a warning says there is nothing between them and
+  nothing is opened.
+- A picked range runs the `-From` path in full: its results, its run label (`range-<A short>-<B short>`, or
+  `range-<A short>-working` for `w`) and `Commit` (`$null`) are those of the `-From` command.
 
 The touched column:
 
@@ -386,17 +448,21 @@ The touched column:
   name, with its range (`0000000` for an empty side), e.g.
   `repos: og-brawler-unreal 758fb77..6245add, og-brawler e289ac3..db4ec6a, ...`, plus `(added)` or
   `(removed)`; a `missing-commit` repo shows as `<name> (missing-commit)`.
-- A `!` row can still be picked: Enter then fails with the same error as `-Commit <its sha>` would.
+- A `!` row can still be picked: Enter then fails with the same error as `-Commit <its sha>` would. As an end
+  of a range (a mark and Enter, `h` or `w`) it runs the `-From` path, which reads the pins of the two ends and
+  never resolves that row's own cascade: the range may open, or fail with the error of the `-From` command
+  it stands for.
 - The picker draws on the console's **alternate screen** and restores the screen, cursor and colours in a
-  `finally`, also after an error or Ctrl+C (which may only take effect at the next key press). The picked
-  commit's results are written after that, on your normal screen.
+  `finally`, also after an error or Ctrl+C (which may only take effect at the next key press). The results
+  of what you picked are written after that, on your normal screen.
 - It needs an **interactive console**. With redirected input or output (a script, a pipe, CI) or a host
   without virtual-terminal support it fails before running any git command:
   `The commit picker needs an interactive console, but its input is redirected. Name the commit instead: oggitdiff -Commit <sha>`.
+  A range is named with `oggitdiff -From <A> [-To <B> | -IncludeWorkingTree]`.
 - `…` needs a console whose output encoding is UTF-8 (code page 65001); on an OEM code page such as 437 it
   shows as `?`. A subject with wide characters (CJK, emoji) may wrap, as the width counts UTF-16 units.
-- `-PerFile` and `-Tool` apply to the picked commit. `-Count` without `-Pick` makes PowerShell prompt for
-  `-Pick`.
+- `-PerFile` and `-Tool` apply to what you pick, as to the `-Commit` or `-From` command it stands for.
+  `-Count` without `-Pick` makes PowerShell prompt for `-Pick`.
 
 ### Limits
 
@@ -505,13 +571,16 @@ steamcmd uploads files, it does not link into the game.
   at an existing `steamcmd.exe`.
 - No running `UnrealEditor` while packaging.
 
-### Config schema (`.psd1`, schema version 1)
+### Config schema (`.psd1`, schema version 2)
 
-Relative paths resolve against the config file's own folder. Unknown keys are rejected.
+Relative paths resolve against the config file's own folder. Unknown keys are rejected at every
+level, and every error names the key. Version 2 separates **what is packaged** (`Builds`) from
+**where it goes** (the depots of each app), so one packaged build can feed several depots, for
+example a dedicated server shipped both inside the game and as its own tool app.
 
 ```powershell
 @{
-    SchemaVersion  = 1
+    SchemaVersion  = 2
     ProjectFile    = '..\..\MyGame.uproject'   # must exist
     EngineRoot     = ''            # optional; '' => resolve from the .uproject EngineAssociation
     Platform       = 'Win64'       # only 'Win64'
@@ -519,20 +588,81 @@ Relative paths resolve against the config file's own folder. Unknown keys are re
     Branch         = ''            # beta branch to SetLive; '' => no SetLive; 'default' is always rejected
     OutputRoot     = '..\..\Saved\Steam\Builds'
     KeepLast       = 3             # build folders kept in OutputRoot; >= 1
+    Builds = @(                    # what is packaged; each build at most once per publish
+        @{
+            Name               = 'client'              # unique; [a-z0-9-]+
+            TargetType         = 'Client'              # Client | Server | Game
+            Configuration      = 'Shipping'            # Development | Shipping
+            ExpectedExecutable = 'MyGameClient.exe'    # relative to the build ContentRoot
+            FileExclusions     = @('*.pdb', 'Manifest_*.txt')
+            ExtraFiles         = @()                   # @(@{ Source = 'rel\to\config'; Destination = 'rel\to\ContentRoot' })
+        }
+        @{
+            Name               = 'server'
+            TargetType         = 'Server'
+            Configuration      = 'Shipping'
+            ExpectedExecutable = 'MyGameServer.exe'
+            FileExclusions     = @('*.pdb', 'Manifest_*.txt', 'HostLogs\*', 'join_info.txt')
+            # ServerLauncher   = @{ ... }              # optional, Server/Game builds; see "Dedicated-server host launcher"
+        }
+    )
+    Apps = @(                      # where it goes
+        @{
+            Name   = 'game'
+            AppId  = 0             # 0 = placeholder; allowed only when the app is not uploaded
+            Depots = @(
+                @{ Name = 'game-client'; DepotId = 0; Build = 'client' }                         # DepotId 0 = placeholder, as AppId
+                @{ Name = 'game-server'; DepotId = 0; Build = 'server'; DepotPath = 'Server' }   # lands in <install>\Server
+            )
+        }
+        @{
+            Name   = 'server-tool'
+            AppId  = 0
+            Depots = @( @{ Name = 'tool-server'; DepotId = 0; Build = 'server' } )
+        }
+    )
+    Profiles = @{                  # optional; named depot sets for -Profile
+        Default         = 'playtest'                   # required when Profiles is present
+        'playtest'      = @('game-client', 'game-server')
+        'playtest-tool' = @('game-client', 'game-server', 'tool-server')
+    }
+}
+```
+
+- **Builds**: `Name`, `TargetType` and `Configuration` are required. A build no depot uses only gives
+  a warning.
+- **Depots**: `Name` is `[a-z0-9-]+` and unique across all apps; `Build` names a build of the file.
+  `DepotPath` (default `.`) is the folder inside the app install that the build lands in: relative,
+  with no `..` segment, no wildcard and no character a folder name cannot hold. `\` and `/` are both
+  accepted and written as `\`.
+- **Profiles**: every key but `Default` is a profile name (`[a-z0-9-]+`) listing one or more depots.
+  A key with a `-` must be quoted in a `.psd1` (`'playtest-tool' = ...`); a bare `playtest-tool`
+  does not parse. Without `Profiles` a publish selects every depot.
+- References to builds and depots match case-insensitively.
+
+**Schema version 1** is still accepted, with unchanged behaviour: there are no `Builds`, every
+depot carries the build keys itself (`TargetType`, `Configuration`, `ExpectedExecutable`,
+`FileExclusions`, `ExtraFiles`, `ServerLauncher`), and each depot becomes an implicit build named
+after it, with `DepotPath` `.`. `Builds`, `Profiles` and `DepotPath` are unknown keys in version 1;
+`-Depots` works on version 1 files too.
+
+```powershell
+@{
+    SchemaVersion = 1
+    # ProjectFile, EngineRoot, Platform, BuilderAccount, Branch, OutputRoot, KeepLast as above
     Apps = @(
         @{
             Name   = 'game'
-            AppId  = 0             # 0 = placeholder; allowed only with -NoUpload
+            AppId  = 0
             Depots = @(
                 @{
-                    Name               = 'game-win64'          # unique across the file; [a-z0-9-]+
-                    DepotId            = 0                     # 0 = placeholder, same rule as AppId
-                    TargetType         = 'Client'              # Client | Server | Game
-                    Configuration      = 'Shipping'            # Development | Shipping
-                    ExpectedExecutable = 'MyGameClient.exe'    # relative to the depot ContentRoot
+                    Name               = 'game-win64'
+                    DepotId            = 0
+                    TargetType         = 'Client'
+                    Configuration      = 'Shipping'
+                    ExpectedExecutable = 'MyGameClient.exe'
                     FileExclusions     = @('*.pdb', 'Manifest_*.txt')
-                    ExtraFiles         = @()                   # @(@{ Source = 'rel\to\config'; Destination = 'rel\to\ContentRoot' })
-                    # ServerLauncher   = @{ ... }              # optional, Server/Game depots; see "Dedicated-server host launcher"
+                    ExtraFiles         = @()
                 }
             )
         }
@@ -540,23 +670,57 @@ Relative paths resolve against the config file's own folder. Unknown keys are re
 }
 ```
 
+### Choosing destinations per upload
+
+One build feeds every destination of a run: `Publish-OgSteamBuild` packages each build the
+selected depots need **exactly once**, and every selected depot of every app gets the same build
+label. The selection is:
+
+| Passed | Selected depots |
+|---|---|
+| `-Depots <name>[, <name>...]` | exactly those |
+| `-Profile <name>` | the depots of that profile |
+| neither | `Profiles.Default`, or every depot when the config has no `Profiles` |
+
+`-Profile` and `-Depots` cannot be combined. An unknown profile or depot name is an error that
+lists the valid names. Only the apps with a selected depot get an app VDF and a steamcmd run.
+
+**Partial-app guard (S6).** If an app has a selected depot, all of its configured depots must be
+selected, otherwise the publish stops before git and packaging, naming the depots it leaves out.
+What Steam does with a depot that an app build leaves out is not documented: its previous build
+could stay installed next to the new one, e.g. an old server with a mismatching build label.
+`-AllowPartialApp` uploads anyway. The guard also applies to `-NoUpload` and `-Preview`, so a dry
+run shows it.
+
+Shared depots (one depot listed in two apps by Steam) are not an option while the owning app is
+unreleased: Steam refuses to share a depot from an unreleased application. Listing the same build
+under two apps, as `server` above, uploads it once per app instead.
+
 ### Cmdlets
 
 | Cmdlet | Purpose |
 |---|---|
-| `Publish-OgSteamBuild` (`ogsteampublish`) | The pipeline: validate config → check git → package each depot → write `build_info.txt` into each depot → write VDFs → steamcmd upload per app → prune old builds. |
+| `Publish-OgSteamBuild` (`ogsteampublish`) | The pipeline: validate config → select depots (`-Profile`, `-Depots`) → partial-app guard → check git → package each selected build once → write `build_info.txt` into each build → write VDFs → steamcmd upload per selected app → prune old builds. |
 | `Invoke-OgUnrealPackage` | One UAT BuildCookRun (build, cook, stage, package, pak, archive) for a Win64 Client, Server or Game target. |
 | `Install-OgSteamCmd` | Downloads Valve's `steamcmd.zip` and runs it once so it self-updates. Idempotent unless `-Force`. |
 | `New-OgDedicatedServerLauncher` | Writes the host launcher below into a folder; `Publish-OgSteamBuild` calls it for every depot with a `ServerLauncher` key. |
 | `Import-OgSteamConfig` (private) | Loads and validates the config above. |
 | `New-OgSteamBuildVdf` (private) | Writes the `app_build_<AppId>.vdf` and `depot_build_<DepotId>.vdf` files. |
 
-Build layout: `<OutputRoot>\<label>\<DepotName>\` holds each packaged depot and
-`<OutputRoot>\<label>\_steam\<AppName>\` its VDFs; steamcmd logs go to
-`<OutputRoot>\<label>\_steam\output\`. The label is `yyyyMMdd-HHmmss-<sha7>`, with
-`-dirty` appended for an `-AllowDirty` build.
+Build layout: `<OutputRoot>\<label>\<BuildName>\` holds each packaged build (for a version 1
+config, the depot name) and `<OutputRoot>\<label>\_steam\<AppName>\` each selected app's VDFs;
+steamcmd logs go to `<OutputRoot>\<label>\_steam\output\`. The label is `yyyyMMdd-HHmmss-<sha7>`,
+with `-dirty` appended for an `-AllowDirty` build. `-SkipPackage -BuildLabel <label>` reuses the
+`<label>\<BuildName>\` folders the selection needs, so one cook can be published to other
+destinations later.
 
-Every depot ContentRoot gets a generated `build_info.txt` (also with `-SkipPackage`), so the
+Each depot VDF maps its build's ContentRoot to the depot's `DepotPath`
+(`"LocalPath" "*"`, `"DepotPath" "Server"`, `"recursive" "1"`) with the build's `FileExclusions`.
+In a dry run where several depots of one app still have the placeholder DepotId `0`, their depot
+VDFs are named `depot_build_0_<DepotName>.vdf` so they do not overwrite each other; an upload never
+gets that far with a placeholder.
+
+Every build ContentRoot gets a generated `build_info.txt` (also with `-SkipPackage`), so the
 shipped build can identify itself: UTF-8 without BOM, LF, the lines `label=<label>`, `sha=<sha7>`,
 `dirty=true|false` and `created=<yyyy-MM-ddTHH:mm:ssZ>` (UTC time of the publish run). A
 `FileExclusions` pattern that matches it, or an `ExtraFiles` entry that targets it, is rejected.
@@ -569,14 +733,21 @@ to keep out files that running the build in place writes into the ContentRoot, s
 
 - `SizeBytes`: the whole ContentRoot.
 - `UploadBytes`: what the depot VDF hands to steamcmd, i.e. the ContentRoot without the files its
-  `FileExclusions` match.
+  build's `FileExclusions` match.
+
+The result also has `Profile` (the profile whose depots were selected, or `''`), `Depots` (one entry
+per selected depot: `Name`, `AppName`, `Build`, `DepotPath`, `ContentRoot`, `BuildInfoPath`,
+`ServerLauncher`, `SizeBytes`, `UploadBytes`; depots of one build share its values) and
+`Destinations` (one entry per selected depot: `App`, `Depot`, `Build`, `DepotPath`, `UploadBytes`).
 
 ```powershell
 Install-OgSteamCmd
-Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -NoUpload     # local check, no Steam
+Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -NoUpload     # default profile, no Steam
 Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -Preview      # Steam-side dry run
 Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -Branch beta  # upload, set live on 'beta'
-Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -SkipPackage -BuildLabel <label>  # reuse a build
+Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -Profile playtest-tool  # another depot set
+Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -Depots game-client -AllowPartialApp  # one depot of 'game'
+Publish-OgSteamBuild -ConfigPath .\tools\steam\steam-publish.psd1 -SkipPackage -BuildLabel <label> -Profile playtest-tool  # reuse a build
 ```
 
 steamcmd runs attached to the console, so on the first login it asks for the password and
@@ -585,8 +756,8 @@ passes credentials.
 
 ### Dedicated-server host launcher
 
-A depot with a `ServerLauncher` key (TargetType `Server` or `Game`, `ExpectedExecutable` set)
-gets four generated files in its ContentRoot, also with `-SkipPackage`:
+A build (version 1: a depot) with a `ServerLauncher` key (TargetType `Server` or `Game`,
+`ExpectedExecutable` set) gets four generated files in its ContentRoot, also with `-SkipPackage`:
 
 | File | Purpose |
 |---|---|
@@ -602,7 +773,7 @@ ServerLauncher = @{
     JoinLinePattern  = 'Session: (?:(?<joined>joined)|(?<left>left)) players=(?<players>\d+) tested=(?<tested>\d+)'  # required
     ServerArguments  = '/Game/Maps/Arena'     # optional; put before -port=<Port> -log -abslog=<log>
     ReadyLinePattern = ''                     # optional; the log line that shows the server listens
-    ClientLaunch     = 'steam://rungameid/{AppId:game}'  # optional; a URI or a path relative to the ContentRoot
+    ClientLaunch     = @('..\MyGameClient.exe', 'steam://rungameid/{AppId:game}')  # optional; one entry or fallbacks, see below
     LocalHint        = ''                     # optional; extra line printed after the game is offered
 }
 ```
@@ -612,8 +783,18 @@ ServerLauncher = @{
 count after the event). **`tested`** (the tested session size) and `local` are optional. A match
 prints `Player joined (2/3)`, `Player left (1/3)` or, above the tested size,
 `Player joined (4 players - above the tested 3, expect degraded performance)`; nobody is ever
-refused. `{AppId:<app name>}` in `ClientLaunch` is filled from the config; an AppId of `0`
-(placeholder) makes the launcher say it cannot start the game instead.
+refused.
+
+`ClientLaunch` is one string or a list of fallbacks; each entry is a URI or a path relative to the
+server's ContentRoot (an absolute path is rejected). `{AppId:<app name>}` is filled from the
+config per entry; a token whose app still has the AppId `0` stays in the settings file and makes
+that entry unusable. When the game is offered, the **first usable entry** in list order wins: a
+path that exists, or a URI without a placeholder token. If none is usable, the launcher says why
+(each missing path, each placeholder app) and asks the host to start the game themselves; with no
+entry it only prints the hint. That lets one server package work in both places:
+`'..\MyGameClient.exe'` finds the client when the server is installed in the game's `Server\`
+folder (`DepotPath = 'Server'`), and `'steam://rungameid/{AppId:game}'` starts it through Steam
+when the server is installed as its own tool app.
 
 What the script does, in order:
 
@@ -633,18 +814,19 @@ What the script does, in order:
    tails that log and prints the friendly join/leave lines.
 6. **Cleanup:** on exit or Ctrl+C it stops the server and removes the UPnP mapping. Closing the
    window instead leaves the mapping in place; the next run reuses it and then removes it.
-7. **Game:** once `ReadyLinePattern` matches (or straight away when it is empty), it asks
-   `Start the game on this PC now? [Y/n]` and runs `ClientLaunch`.
+7. **Game:** once `ReadyLinePattern` matches (or straight away when it is empty), it picks the
+   first usable `ClientLaunch` entry, asks `Start the game on this PC now? [Y/n]` and starts it.
 
 Local mode runs steps 1, 4, 5 and 7 only, and makes no router or internet call.
 
 ### Safety invariants
 
 - **S1** The branch `default` (any case) is rejected at config load, for `-Branch` and in the VDF writer; the default branch is set live only in the Steamworks web UI.
-- **S2** AppId/DepotId `0` and an empty `BuilderAccount` are rejected whenever an upload would happen, before any packaging.
+- **S2** AppId/DepotId `0` of a selected depot or of its app, and an empty `BuilderAccount`, are rejected whenever an upload would happen, before any packaging. An app with no selected depot may keep the placeholder. A real ID used twice anywhere in the config is rejected too.
 - **S3** A git tree with uncommitted changes (or a `-dirty` label with `-SkipPackage`) is refused unless `-AllowDirty`.
 - **S4** steamcmd only ever gets `+login <BuilderAccount> +run_app_build <vdf> +quit`; never a password.
 - **S5** Packaging refuses to start while an `UnrealEditor` process is running.
+- **S6** An app is uploaded with all of its depots or not at all, unless `-AllowPartialApp`; checked before git and packaging, also for `-NoUpload` and `-Preview`.
 
 The Steam cmdlets do not support `-WhatIf`; use `-NoUpload` or `-Preview` for a dry run.
 

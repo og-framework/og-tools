@@ -660,6 +660,442 @@ Describe 'Publish-OgSteamBuild' {
             $left | Should -Be @($current, '20250105-000000-5555555', 'notes')
         }
     }
+
+    Context 'Schema version 2: builds, destinations and profiles' {
+        BeforeAll {
+            function New-TestV2SteamConfig {
+                param(
+                    [string] $Root,
+                    [int] $GameAppId = 0,
+                    [int] $GameClientDepotId = 0,
+                    [int] $GameServerDepotId = 0,
+                    [int] $ToolAppId = 0,
+                    [int] $ToolServerDepotId = 0,
+                    [string] $BuilderAccount = '',
+                    [string] $ServerLauncher = '',
+                    [switch] $NoProfiles
+                )
+                New-Item -ItemType Directory -Path (Join-Path $Root 'project\tools\steam') -Force | Out-Null
+                Set-Content -LiteralPath (Join-Path $Root 'project\Game.uproject') -Value '{}'
+                Set-Content -LiteralPath (Join-Path $Root 'project\tools\server template.bat') -Value '@echo server'
+                $profiles = if ($NoProfiles) { '' } else {
+                    @'
+    Profiles = @{
+        Default         = 'playtest'
+        'playtest'      = @('game-client', 'game-server')
+        'playtest-tool' = @('game-client', 'game-server', 'tool-server')
+        'game-only'     = @('game-client')
+        'release'       = @('game-client', 'tool-server')
+    }
+'@
+                }
+                $configPath = Join-Path $Root 'project\tools\steam\steam-publish.psd1'
+                Set-Content -LiteralPath $configPath -Value @"
+@{
+    SchemaVersion  = 2
+    ProjectFile    = '..\..\Game.uproject'
+    Platform       = 'Win64'
+    BuilderAccount = '$BuilderAccount'
+    Branch         = 'playtest'
+    OutputRoot     = '..\..\Saved\Steam\Builds'
+    KeepLast       = 3
+    Builds = @(
+        @{
+            Name               = 'client'
+            TargetType         = 'Client'
+            Configuration      = 'Shipping'
+            ExpectedExecutable = 'GameClient.exe'
+            FileExclusions     = @('*.pdb', 'Manifest_*.txt')
+        }
+        @{
+            Name               = 'server'
+            TargetType         = 'Server'
+            Configuration      = 'Shipping'
+            ExpectedExecutable = 'GameServer.exe'
+            FileExclusions     = @('*.pdb', 'HostLogs\*')
+            ExtraFiles         = @(@{ Source = '..\server template.bat'; Destination = 'run_server.bat' })
+            $ServerLauncher
+        }
+    )
+    Apps = @(
+        @{
+            Name   = 'game'
+            AppId  = $GameAppId
+            Depots = @(
+                @{ Name = 'game-client'; DepotId = $GameClientDepotId; Build = 'client' }
+                @{ Name = 'game-server'; DepotId = $GameServerDepotId; Build = 'server'; DepotPath = 'Server' }
+            )
+        }
+        @{
+            Name   = 'server-tool'
+            AppId  = $ToolAppId
+            Depots = @(
+                @{ Name = 'tool-server'; DepotId = $ToolServerDepotId; Build = 'server' }
+            )
+        }
+    )
+$profiles
+}
+"@
+                $configPath
+            }
+
+            function New-TestV2ReadyConfig {
+                param([string] $Root, [int] $ToolAppId = 2000, [int] $ToolServerDepotId = 2001, [int] $GameServerDepotId = 1002)
+                New-TestV2SteamConfig -Root $Root -GameAppId 1000 -GameClientDepotId 1001 -GameServerDepotId $GameServerDepotId `
+                    -ToolAppId $ToolAppId -ToolServerDepotId $ToolServerDepotId -BuilderAccount 'builder'
+            }
+
+            function ConvertTo-TestGolden {
+                param([Parameter(Mandatory)][string] $Text)
+                ($Text -replace "`r`n", "`n").Replace('|', "`t").TrimEnd("`n") + "`n"
+            }
+
+            function ConvertTo-TestVdfLiteral {
+                param([Parameter(Mandatory)][string] $Value)
+                $Value.Replace('\', '\\').Replace('"', '\"')
+            }
+
+            function Get-TestUtf8Text {
+                param([Parameter(Mandatory)][string] $Path)
+                [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
+            }
+        }
+
+        It 'packages a build that two selected depots use exactly once, into the label folder under the build name' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool -NoUpload
+            $buildDir = Join-Path $outputRoot $result.BuildLabel
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 2 -Exactly
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly -ParameterFilter {
+                $TargetType -eq 'Server' -and $Configuration -eq 'Shipping' -and
+                $ArchiveDirectory -eq (Join-Path $buildDir 'server') -and $ExpectedExecutable -eq 'GameServer.exe'
+            }
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly -ParameterFilter {
+                $TargetType -eq 'Client' -and $ArchiveDirectory -eq (Join-Path $buildDir 'client')
+            }
+            $callLog | Should -Be @('git status', 'git rev-parse', 'package Client', 'package Server')
+            @(Get-ChildItem -LiteralPath $buildDir -Directory | ForEach-Object Name | Sort-Object) | Should -Be @('_steam', 'client', 'server')
+        }
+
+        It 'uses the default profile when neither -Profile nor -Depots is passed' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -NoUpload
+            $result.Profile | Should -BeExactly 'playtest'
+            @($result.Destinations | ForEach-Object Depot) | Should -Be @('game-client', 'game-server')
+            @($result.AppVdfs | ForEach-Object AppName) | Should -Be @('game')
+            Test-Path -LiteralPath (Join-Path $result.BuildDirectory '_steam\server-tool') | Should -BeFalse
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 2 -Exactly
+        }
+
+        It 'uploads every depot of a version 2 config without Profiles' {
+            $config = New-TestV2SteamConfig -Root $root -NoProfiles
+            $result = Publish-OgSteamBuild -ConfigPath $config -NoUpload
+            $result.Profile | Should -BeExactly ''
+            @($result.Destinations | ForEach-Object Depot) | Should -Be @('game-client', 'game-server', 'tool-server')
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 2 -Exactly
+        }
+
+        It 'packages only the builds of the selected depots (-Depots, case-insensitive)' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Depots 'Game-Client' -AllowPartialApp -NoUpload
+            $result.Profile | Should -BeExactly ''
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly -ParameterFilter { $TargetType -eq 'Client' }
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly
+            @($result.Depots | ForEach-Object Name) | Should -Be @('game-client')
+            Test-Path -LiteralPath (Join-Path $result.BuildDirectory 'server') | Should -BeFalse
+            @(Get-ChildItem -LiteralPath (Join-Path $result.BuildDirectory '_steam\game') -File | ForEach-Object Name | Sort-Object) |
+                Should -Be @('app_build_0.vdf', 'depot_build_0.vdf')
+        }
+
+        It 'reports one Destination per selected depot, sharing the build label, ContentRoot and sizes of its build' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool -NoUpload
+            $result.Destinations.Count | Should -Be 3
+            foreach ($d in $result.Destinations) {
+                @($d.PSObject.Properties.Name) | Should -Be @('App', 'Depot', 'Build', 'DepotPath', 'UploadBytes')
+            }
+            @($result.Destinations | ForEach-Object { "$($_.App)/$($_.Depot)/$($_.Build)/$($_.DepotPath)" }) |
+                Should -Be @('game/game-client/client/.', 'game/game-server/server/Server', 'server-tool/tool-server/server/.')
+            $gameServer = $result.Depots | Where-Object Name -EQ 'game-server'
+            $toolServer = $result.Depots | Where-Object Name -EQ 'tool-server'
+            $toolServer.ContentRoot | Should -Be $gameServer.ContentRoot
+            $gameServer.ContentRoot | Should -Be (Join-Path $result.BuildDirectory 'server\WindowsServer')
+            $toolServer.BuildInfoPath | Should -Be $gameServer.BuildInfoPath
+            $gameServer.UploadBytes | Should -Be ($gameServer.SizeBytes - 10)
+            @($result.Destinations | Where-Object Build -EQ 'server' | ForEach-Object UploadBytes) | Should -Be @($gameServer.UploadBytes, $gameServer.UploadBytes)
+            $found = @(Get-ChildItem -LiteralPath $result.BuildDirectory -Recurse -File -Filter 'build_info.txt')
+            $found.Count | Should -Be 2
+            foreach ($file in $found) { (Get-Content -LiteralPath $file.FullName)[0] | Should -BeExactly "label=$($result.BuildLabel)" }
+        }
+
+        It 'writes the golden VDFs for two apps and three depots, with DepotPath "Server" on the bundled server only' {
+            $config = New-TestV2ReadyConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool -NoUpload
+            $steamDir = Join-Path $result.BuildDirectory '_steam'
+            $clientRoot = ConvertTo-TestVdfLiteral (Join-Path $result.BuildDirectory 'client\WindowsClient')
+            $serverRoot = ConvertTo-TestVdfLiteral (Join-Path $result.BuildDirectory 'server\WindowsServer')
+            $output = ConvertTo-TestVdfLiteral (Join-Path $steamDir 'output')
+            $label = $result.BuildLabel
+
+            @($result.AppVdfs | ForEach-Object Path) | Should -Be @((Join-Path $steamDir 'game\app_build_1000.vdf'), (Join-Path $steamDir 'server-tool\app_build_2000.vdf'))
+            @(Get-ChildItem -LiteralPath $steamDir -Recurse -File | ForEach-Object { $_.FullName.Substring($steamDir.Length + 1) } | Sort-Object) |
+                Should -Be @('game\app_build_1000.vdf', 'game\depot_build_1001.vdf', 'game\depot_build_1002.vdf', 'server-tool\app_build_2000.vdf', 'server-tool\depot_build_2001.vdf')
+
+            Get-TestUtf8Text (Join-Path $steamDir 'game\app_build_1000.vdf') | Should -BeExactly (ConvertTo-TestGolden @"
+"AppBuild"
+{
+|"AppID"|"1000"
+|"Desc"|"$label"
+|"BuildOutput"|"$output"
+|"ContentRoot"|""
+|"SetLive"|"playtest"
+|"Preview"|"0"
+|"Depots"
+|{
+||"1001"|"$(ConvertTo-TestVdfLiteral (Join-Path $steamDir 'game\depot_build_1001.vdf'))"
+||"1002"|"$(ConvertTo-TestVdfLiteral (Join-Path $steamDir 'game\depot_build_1002.vdf'))"
+|}
+}
+"@)
+            Get-TestUtf8Text (Join-Path $steamDir 'game\depot_build_1001.vdf') | Should -BeExactly (ConvertTo-TestGolden @"
+"DepotBuild"
+{
+|"DepotID"|"1001"
+|"ContentRoot"|"$clientRoot"
+|"FileMapping"
+|{
+||"LocalPath"|"*"
+||"DepotPath"|"."
+||"recursive"|"1"
+|}
+|"FileExclusion"|"*.pdb"
+|"FileExclusion"|"Manifest_*.txt"
+}
+"@)
+            Get-TestUtf8Text (Join-Path $steamDir 'game\depot_build_1002.vdf') | Should -BeExactly (ConvertTo-TestGolden @"
+"DepotBuild"
+{
+|"DepotID"|"1002"
+|"ContentRoot"|"$serverRoot"
+|"FileMapping"
+|{
+||"LocalPath"|"*"
+||"DepotPath"|"Server"
+||"recursive"|"1"
+|}
+|"FileExclusion"|"*.pdb"
+|"FileExclusion"|"HostLogs\\*"
+}
+"@)
+            Get-TestUtf8Text (Join-Path $steamDir 'server-tool\app_build_2000.vdf') | Should -BeExactly (ConvertTo-TestGolden @"
+"AppBuild"
+{
+|"AppID"|"2000"
+|"Desc"|"$label"
+|"BuildOutput"|"$output"
+|"ContentRoot"|""
+|"SetLive"|"playtest"
+|"Preview"|"0"
+|"Depots"
+|{
+||"2001"|"$(ConvertTo-TestVdfLiteral (Join-Path $steamDir 'server-tool\depot_build_2001.vdf'))"
+|}
+}
+"@)
+            Get-TestUtf8Text (Join-Path $steamDir 'server-tool\depot_build_2001.vdf') | Should -BeExactly (ConvertTo-TestGolden @"
+"DepotBuild"
+{
+|"DepotID"|"2001"
+|"ContentRoot"|"$serverRoot"
+|"FileMapping"
+|{
+||"LocalPath"|"*"
+||"DepotPath"|"."
+||"recursive"|"1"
+|}
+|"FileExclusion"|"*.pdb"
+|"FileExclusion"|"HostLogs\\*"
+}
+"@)
+        }
+
+        It 'names the depot VDFs of a placeholder dry run after the depots' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -NoUpload
+            $gameDir = Join-Path $result.BuildDirectory '_steam\game'
+            @(Get-ChildItem -LiteralPath $gameDir -File | ForEach-Object Name | Sort-Object) |
+                Should -Be @('app_build_0.vdf', 'depot_build_0_game-client.vdf', 'depot_build_0_game-server.vdf')
+            Get-TestUtf8Text (Join-Path $gameDir 'depot_build_0_game-server.vdf') | Should -Match '"DepotPath"\t"Server"'
+            Get-TestUtf8Text (Join-Path $gameDir 'depot_build_0_game-client.vdf') | Should -Match '"DepotPath"\t"\."'
+        }
+
+        It 'S6: stops <Name> before git and packaging, naming the left-out depot, with <Mode>' -TestCases @(
+            @{ Name = 'game-only'; Mode = '-NoUpload'; Ready = $false; Extra = @{ Profile = 'game-only'; NoUpload = $true } }
+            @{ Name = 'game-only'; Mode = '-Preview'; Ready = $true; Extra = @{ Profile = 'game-only'; Preview = $true } }
+            @{ Name = 'release'; Mode = '-NoUpload'; Ready = $false; Extra = @{ Profile = 'release'; NoUpload = $true } }
+            @{ Name = '-Depots game-server'; Mode = 'an upload'; Ready = $true; Extra = @{ Depots = @('game-server') } }
+        ) {
+            $config = if ($Ready) { New-TestV2ReadyConfig -Root $root } else { New-TestV2SteamConfig -Root $root }
+            $extra = $Extra
+            $err = { Publish-OgSteamBuild -ConfigPath $config @extra } | Should -Throw -PassThru
+            $err.Exception.Message | Should -BeLike "*app 'game' leaves out '*'*"
+            $err.Exception.Message | Should -BeLike '*not documented*-AllowPartialApp*'
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-Git -Times 0 -Exactly
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 0 -Exactly
+            Should -Invoke -ModuleName og-framework -CommandName Resolve-OgSteamCmd -Times 0 -Exactly
+        }
+
+        It 'S6: names exactly the depots the run leaves out' {
+            $config = New-TestV2SteamConfig -Root $root
+            { Publish-OgSteamBuild -ConfigPath $config -Profile game-only -NoUpload } |
+                Should -Throw "*only some depots of an app: app 'game' leaves out 'game-server'. What Steam*"
+            { Publish-OgSteamBuild -ConfigPath $config -Profile release -NoUpload } |
+                Should -Throw "*only some depots of an app: app 'game' leaves out 'game-server'. What Steam*"
+        }
+
+        It 'S6: lets <Name> through with -AllowPartialApp' -TestCases @(
+            @{ Name = 'game-only'; Builds = 1 }
+            @{ Name = 'release'; Builds = 2 }
+        ) {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile $Name -AllowPartialApp -NoUpload
+            $result.Profile | Should -BeExactly $Name
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times $Builds -Exactly
+        }
+
+        It 'S6: does not apply to an app whose every depot is selected' {
+            $config = New-TestV2SteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Depots tool-server -NoUpload
+            @($result.Destinations | ForEach-Object Depot) | Should -Be @('tool-server')
+            @($result.AppVdfs | ForEach-Object AppName) | Should -Be @('server-tool')
+        }
+
+        It 'S2: an unselected app with placeholder IDs does not block an upload' {
+            $config = New-TestV2ReadyConfig -Root $root -ToolAppId 0 -ToolServerDepotId 0
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest
+            $result.Uploaded | Should -BeTrue
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgProcess -Times 1 -Exactly -ParameterFilter {
+                $ArgumentList[3] -eq (Join-Path $result.BuildDirectory '_steam\game\app_build_1000.vdf')
+            }
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgProcess -Times 1 -Exactly
+        }
+
+        It 'S2: a selected depot with the placeholder DepotId blocks the upload before git or packaging' {
+            $config = New-TestV2ReadyConfig -Root $root -ToolAppId 0 -ToolServerDepotId 0 -GameServerDepotId 0
+            $err = { Publish-OgSteamBuild -ConfigPath $config -Profile playtest } | Should -Throw -PassThru
+            $err.Exception.Message | Should -BeLike "*Depot 'game-server': DepotId is the placeholder 0*"
+            $err.Exception.Message | Should -Not -BeLike '*tool-server*'
+            $err.Exception.Message | Should -Not -BeLike '*server-tool*'
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-Git -Times 0 -Exactly
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 0 -Exactly
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgProcess -Times 0 -Exactly
+        }
+
+        It 'S2: a selected app with the placeholder AppId blocks the upload' {
+            $config = New-TestV2ReadyConfig -Root $root -ToolAppId 0
+            { Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool } | Should -Throw "*App 'server-tool': AppId is the placeholder 0*"
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 0 -Exactly
+        }
+
+        It 'passes the selected depots to the readiness check' {
+            Mock -ModuleName og-framework -CommandName Assert-OgSteamUploadReady -MockWith { }
+            $config = New-TestV2ReadyConfig -Root $root
+            Publish-OgSteamBuild -ConfigPath $config -Profile playtest | Out-Null
+            Should -Invoke -ModuleName og-framework -CommandName Assert-OgSteamUploadReady -Times 1 -Exactly -ParameterFilter {
+                (@($DepotNames | Sort-Object) -join ',') -eq 'game-client,game-server'
+            }
+        }
+
+        It 'runs steamcmd once per app with a selected depot' {
+            $config = New-TestV2ReadyConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgProcess -Times 2 -Exactly
+            foreach ($appVdf in $result.AppVdfs) {
+                $vdfPath = $appVdf.Path
+                Should -Invoke -ModuleName og-framework -CommandName Invoke-OgProcess -Times 1 -Exactly -ParameterFilter {
+                    ($ArgumentList -join ' ') -ceq "+login builder +run_app_build $vdfPath +quit"
+                }
+            }
+        }
+
+        It 'rejects <Case> before git' -TestCases @(
+            @{ Case = '-Profile together with -Depots'; Extra = @{ Profile = 'playtest'; Depots = @('game-client') }; Message = '*-Profile and -Depots cannot be combined*' }
+            @{ Case = 'an unknown profile'; Extra = @{ Profile = 'nightly' }; Message = "*unknown profile 'nightly'. Profiles of *: game-only, playtest, playtest-tool, release*" }
+            @{ Case = 'an unknown depot'; Extra = @{ Depots = @('game-client', 'tool-servr') }; Message = "*-Depots names unknown depot 'tool-servr'. Depots of *: game-client, game-server, tool-server*" }
+        ) {
+            $config = New-TestV2SteamConfig -Root $root
+            $extra = $Extra
+            { Publish-OgSteamBuild -ConfigPath $config -NoUpload @extra } | Should -Throw $Message
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-Git -Times 0 -Exactly
+        }
+
+        It 'reuses the build-name folders of a label with -SkipPackage for another profile' {
+            $config = New-TestV2SteamConfig -Root $root
+            $first = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool -NoUpload
+            Remove-Item -LiteralPath (Join-Path $first.BuildDirectory '_steam') -Recurse -Force
+            $again = Publish-OgSteamBuild -ConfigPath $config -Profile release -AllowPartialApp -NoUpload -SkipPackage -BuildLabel $first.BuildLabel
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 2 -Exactly
+            $again.BuildLabel | Should -Be $first.BuildLabel
+            @($again.Destinations | ForEach-Object Depot) | Should -Be @('game-client', 'tool-server')
+            ($again.Depots | Where-Object Name -EQ 'tool-server').ContentRoot | Should -Be ($first.Depots | Where-Object Name -EQ 'tool-server').ContentRoot
+            @($again.AppVdfs | ForEach-Object AppName) | Should -Be @('game', 'server-tool')
+        }
+
+        It 'throws on -SkipPackage when a selected build is missing from the label' {
+            $config = New-TestV2SteamConfig -Root $root
+            $first = Publish-OgSteamBuild -ConfigPath $config -Depots game-client -AllowPartialApp -NoUpload
+            { Publish-OgSteamBuild -ConfigPath $config -NoUpload -SkipPackage -BuildLabel $first.BuildLabel } |
+                Should -Throw "*build 'server' of build label '$($first.BuildLabel)' does not exist*"
+        }
+
+        It 'generates the launcher once into the shared server build, with the ClientLaunch list' {
+            $launcher = "ServerLauncher = @{ Title = 'Game server'; Port = 7777; " +
+                "JoinLinePattern = 'S: (?:(?<joined>joined)|(?<left>left)) players=(?<players>\d+)'; " +
+                "ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}') }"
+            $config = New-TestV2SteamConfig -Root $root -GameAppId 1000 -ServerLauncher $launcher
+            $result = Publish-OgSteamBuild -ConfigPath $config -Profile playtest-tool -NoUpload
+            $gameServer = $result.Depots | Where-Object Name -EQ 'game-server'
+            $toolServer = $result.Depots | Where-Object Name -EQ 'tool-server'
+            [object]::ReferenceEquals($gameServer.ServerLauncher, $toolServer.ServerLauncher) | Should -BeTrue
+            $gameServer.ServerLauncher.ClientLaunch | Should -Be @('..\GameClient.exe', 'steam://rungameid/1000')
+            $settings = Import-PowerShellDataFile -LiteralPath (Join-Path $gameServer.ContentRoot 'host_server.settings.psd1')
+            $settings.ClientLaunch | Should -Be @('..\GameClient.exe', 'steam://rungameid/1000')
+            Join-Path ($result.Depots | Where-Object Name -EQ 'game-client').ContentRoot 'host_server.ps1' | Should -Not -Exist
+        }
+
+        It 'names the build in an early FileExclusions rejection' {
+            $config = New-TestV2SteamConfig -Root $root
+            (Get-Content -Raw -LiteralPath $config).Replace("FileExclusions     = @('*.pdb', 'HostLogs\*')", "FileExclusions     = @('*.pdb', '*.txt')") |
+                Set-Content -LiteralPath $config
+            { Publish-OgSteamBuild -ConfigPath $config -NoUpload } | Should -Throw "*pattern '``*.txt' of build 'server' matches 'build_info.txt'*"
+        }
+    }
+
+    Context 'Schema version 1 configs keep their behaviour' {
+        It 'selects every depot, reports Profile '''' and one Destination per depot' {
+            $config = New-TestSteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -NoUpload
+            $result.Profile | Should -BeExactly ''
+            @($result.Destinations | ForEach-Object { "$($_.App)/$($_.Depot)/$($_.Build)/$($_.DepotPath)" }) |
+                Should -Be @('client/client-win64/client-win64/.', 'server/server-win64/server-win64/.')
+            ($result.Destinations | Where-Object Depot -EQ 'server-win64').UploadBytes | Should -Be ($result.Depots | Where-Object Name -EQ 'server-win64').UploadBytes
+        }
+
+        It 'accepts -Depots on a version 1 config' {
+            $config = New-TestSteamConfig -Root $root
+            $result = Publish-OgSteamBuild -ConfigPath $config -Depots server-win64 -NoUpload
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly -ParameterFilter { $TargetType -eq 'Server' }
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 1 -Exactly
+            @($result.AppVdfs | ForEach-Object AppName) | Should -Be @('server')
+        }
+
+        It 'rejects -Profile on a config without Profiles' {
+            $config = New-TestSteamConfig -Root $root
+            { Publish-OgSteamBuild -ConfigPath $config -Profile playtest -NoUpload } | Should -Throw "*-Profile 'playtest' was passed, but * defines no Profiles*"
+            Should -Invoke -ModuleName og-framework -CommandName Invoke-OgUnrealPackage -Times 0 -Exactly
+        }
+    }
 }
 
 Describe 'og-framework module surface for Steam publishing' {
@@ -683,7 +1119,7 @@ Describe 'og-framework module surface for Steam publishing' {
     It 'documents every parameter in Get-Help' {
         $help = Get-Help Publish-OgSteamBuild -Full
         $documented = @($help.parameters.parameter | Where-Object { $_.description } | ForEach-Object Name)
-        foreach ($p in 'ConfigPath', 'Branch', 'Description', 'NoUpload', 'Preview', 'AllowDirty', 'SkipPackage', 'BuildLabel', 'SteamCmdPath') {
+        foreach ($p in 'ConfigPath', 'Profile', 'Depots', 'AllowPartialApp', 'Branch', 'Description', 'NoUpload', 'Preview', 'AllowDirty', 'SkipPackage', 'BuildLabel', 'SteamCmdPath') {
             $documented | Should -Contain $p
         }
     }

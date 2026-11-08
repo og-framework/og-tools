@@ -9,7 +9,12 @@ function New-OgSteamBuildVdf {
         KeyValues format (https://partner.steamgames.com/doc/sdk/uploading) for use with
         steamcmd +run_app_build. The app VDF references each depot VDF by absolute path and
         leaves its own ContentRoot empty; every depot VDF carries its own absolute ContentRoot
-        and maps all of it recursively to the depot root.
+        and maps all of it recursively to its DepotPath ('.' = the root of the app install).
+
+        A depot VDF is named depot_build_<DepotId>.vdf. Several depots may share the placeholder
+        DepotId 0 (a dry run before the depots exist) only when each has a distinct Name; they
+        are then written as depot_build_0_<Name>.vdf. Steam never receives such a file: an upload
+        with a placeholder ID is rejected before steamcmd runs.
 
         String values are escaped per KeyValues rules (backslash and double quote). Values
         containing control characters are rejected. Files are written tab-indented, LF line
@@ -34,8 +39,10 @@ function New-OgSteamBuildVdf {
         Writes "Preview" "1": steamcmd produces logs and a manifest without uploading.
 
     .PARAMETER Depots
-        One or more hashtables or objects with keys DepotId (non-negative integer, unique),
-        ContentRoot (absolute directory) and optional FileExclusions (string patterns).
+        One or more hashtables or objects with keys DepotId (non-negative integer, unique except
+        the placeholder 0 as above), ContentRoot (absolute directory), and optional
+        FileExclusions (string patterns), DepotPath (a relative folder without a '..' segment or a
+        wildcard; default '.') and Name (^[a-z0-9-]+$, used only to tell placeholder depots apart).
 
     .PARAMETER OutputDirectory
         Absolute directory the VDF files are written to. Created if missing.
@@ -46,7 +53,10 @@ function New-OgSteamBuildVdf {
     .EXAMPLE
         New-OgSteamBuildVdf -AppId 480 -Description '20260926-120000-abc1234' `
             -BuildOutput 'D:\Builds\_steam\output' -SetLive 'playtest' `
-            -Depots @(@{ DepotId = 481; ContentRoot = 'D:\Builds\client\WindowsClient'; FileExclusions = @('*.pdb') }) `
+            -Depots @(
+                @{ DepotId = 481; ContentRoot = 'D:\Builds\client\WindowsClient'; FileExclusions = @('*.pdb') }
+                @{ DepotId = 482; ContentRoot = 'D:\Builds\server\WindowsServer'; DepotPath = 'Server' }
+            ) `
             -OutputDirectory 'D:\Builds\_steam'
     #>
     [CmdletBinding()]
@@ -97,9 +107,11 @@ function New-OgSteamBuildVdf {
         throw 'Depots must contain at least one depot.'
     }
 
-    $allowedDepotKeys = @('DepotId', 'ContentRoot', 'FileExclusions')
+    $allowedDepotKeys = @('DepotId', 'ContentRoot', 'FileExclusions', 'DepotPath', 'Name')
     $normalized = [System.Collections.Generic.List[pscustomobject]]::new()
     $seenIds = [System.Collections.Generic.HashSet[uint32]]::new()
+    $placeholderNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $placeholderCount = 0
 
     for ($i = 0; $i -lt $Depots.Count; $i++) {
         $depot = $Depots[$i]
@@ -131,7 +143,20 @@ function New-OgSteamBuildVdf {
             throw "Depots[$i].DepotId is out of range: $rawId."
         }
         $depotId = [uint32]$rawId
-        if (-not $seenIds.Add($depotId)) {
+
+        $name = ''
+        if ($values.ContainsKey('Name') -and $null -ne $values['Name']) {
+            $name = [string]$values['Name']
+            if ($name -cnotmatch '^[a-z0-9-]+$') {
+                throw "Depots[$i].Name must match ^[a-z0-9-]+$, got '$name'."
+            }
+        }
+
+        if ($depotId -eq 0) {
+            $placeholderCount++
+            if ($name -ne '') { $null = $placeholderNames.Add($name) }
+        }
+        elseif (-not $seenIds.Add($depotId)) {
             throw "Duplicate DepotId $depotId in Depots."
         }
 
@@ -155,11 +180,27 @@ function New-OgSteamBuildVdf {
             $null = & $escape "Depots[$i].FileExclusions" $pattern
         }
 
+        $mappedPath = '.'
+        if ($values.ContainsKey('DepotPath') -and $null -ne $values['DepotPath']) {
+            $mappedPath = [string]$values['DepotPath']
+            if ([string]::IsNullOrWhiteSpace($mappedPath) -or [System.IO.Path]::IsPathRooted($mappedPath) -or
+                ($mappedPath -split '[\\/]') -contains '..' -or $mappedPath.IndexOfAny([char[]]'*?') -ge 0) {
+                throw "Depots[$i].DepotPath (DepotId $depotId) must be a relative folder without '..' or a wildcard, got '$mappedPath'."
+            }
+            $null = & $escape "Depots[$i].DepotPath" $mappedPath
+        }
+
         $normalized.Add([pscustomobject]@{
             DepotId        = $depotId
+            Name           = $name
             ContentRoot    = [System.IO.Path]::GetFullPath($contentRoot)
             FileExclusions = [string[]]$exclusions
+            DepotPath      = $mappedPath
         })
+    }
+
+    if ($placeholderCount -gt 1 -and $placeholderNames.Count -ne $placeholderCount) {
+        throw "Duplicate DepotId 0 in Depots. Several placeholder depots need a distinct Name each."
     }
 
     $outDir = [System.IO.Path]::GetFullPath($OutputDirectory)
@@ -168,7 +209,7 @@ function New-OgSteamBuildVdf {
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     }
 
-    $depotFiles = [ordered]@{}
+    $depotFiles = [System.Collections.Generic.List[object]]::new()
     foreach ($depot in $normalized) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add('"DepotBuild"')
@@ -178,7 +219,7 @@ function New-OgSteamBuildVdf {
         $lines.Add("`t`"FileMapping`"")
         $lines.Add("`t{")
         $lines.Add("`t`t`"LocalPath`"`t`"*`"")
-        $lines.Add("`t`t`"DepotPath`"`t`".`"")
+        $lines.Add("`t`t`"DepotPath`"`t" + (& $escape 'DepotPath' $depot.DepotPath))
         $lines.Add("`t`t`"recursive`"`t`"1`"")
         $lines.Add("`t}")
         foreach ($pattern in $depot.FileExclusions) {
@@ -186,9 +227,10 @@ function New-OgSteamBuildVdf {
         }
         $lines.Add('}')
 
-        $depotPath = Join-Path $outDir "depot_build_$($depot.DepotId).vdf"
+        $fileName = if ($depot.DepotId -eq 0 -and $placeholderCount -gt 1) { "depot_build_0_$($depot.Name).vdf" } else { "depot_build_$($depot.DepotId).vdf" }
+        $depotPath = Join-Path $outDir $fileName
         [System.IO.File]::WriteAllText($depotPath, (($lines -join "`n") + "`n"), $utf8NoBom)
-        $depotFiles[[string]$depot.DepotId] = $depotPath
+        $depotFiles.Add([pscustomobject]@{ Id = [string]$depot.DepotId; Path = $depotPath })
     }
 
     $app = [System.Collections.Generic.List[string]]::new()
@@ -204,8 +246,8 @@ function New-OgSteamBuildVdf {
     $app.Add("`t`"Preview`"`t`"" + ($Preview.IsPresent ? '1' : '0') + '"')
     $app.Add("`t`"Depots`"")
     $app.Add("`t{")
-    foreach ($id in $depotFiles.Keys) {
-        $app.Add("`t`t" + (& $escape 'DepotId' $id) + "`t" + (& $escape 'DepotVdfPath' $depotFiles[$id]))
+    foreach ($file in $depotFiles) {
+        $app.Add("`t`t" + (& $escape 'DepotId' $file.Id) + "`t" + (& $escape 'DepotVdfPath' $file.Path))
     }
     $app.Add("`t}")
     $app.Add('}')

@@ -398,30 +398,61 @@ function Write-OgHostJoinInfo {
     }
 }
 
+function Get-OgHostClientLaunchEntries {
+    param($Settings)
+    $entries = @()
+    foreach ($entry in @($Settings.ClientLaunch)) {
+        $text = [string]$entry
+        if ($text.Trim()) { $entries += $text }
+    }
+    , $entries
+}
+
+function Resolve-OgHostClientLaunch {
+    param($Settings, [string] $Root)
+    $reasons = @()
+    foreach ($entry in (Get-OgHostClientLaunchEntries -Settings $Settings)) {
+        $placeholder = [regex]::Match($entry, '\{AppId:(?<name>[^}]*)\}')
+        if ($placeholder.Success) {
+            $reasons += "the Steam app '$($placeholder.Groups['name'].Value)' has no AppId yet (placeholder 0)"
+            continue
+        }
+        if ($entry -match '^[A-Za-z][A-Za-z0-9+.-]+:') {
+            return New-Object psobject -Property @{ Target = $entry; WorkingDirectory = ''; Reasons = $reasons }
+        }
+        $path = [System.IO.Path]::GetFullPath((Join-Path $Root $entry))
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            return New-Object psobject -Property @{ Target = $path; WorkingDirectory = (Split-Path -Parent $path); Reasons = $reasons }
+        }
+        $reasons += "the game was not found at '$path'"
+    }
+    New-Object psobject -Property @{ Target = $null; WorkingDirectory = ''; Reasons = $reasons }
+}
+
 function Invoke-OgHostClientLaunchStep {
     param($Settings, [string] $Root)
-    $launch = [string]$Settings.ClientLaunch
-    if (-not $launch) {
-        if ($Settings.ClientLaunchSkipReason) { Write-OgHostLine "Not starting the game automatically: $($Settings.ClientLaunchSkipReason). Start it yourself." 'Yellow' }
-        else { Write-OgHostLine 'Start the game yourself to play on this PC.' }
+    $entries = Get-OgHostClientLaunchEntries -Settings $Settings
+    if ($entries.Count -eq 0) {
+        Write-OgHostLine 'Start the game yourself to play on this PC.'
     }
     else {
-        $answer = [string](Read-OgHostAnswer -Prompt 'Start the game on this PC now? [Y/n]')
-        if ($answer.Trim() -match '^(n|no)$') {
-            Write-OgHostLine 'OK, start the game yourself when you want to play on this PC.'
-        }
-        elseif ($launch -match '^[A-Za-z][A-Za-z0-9+.-]+:') {
-            try { Start-OgHostClientLaunch -Target $launch; Write-OgHostLine "Starting the game ($launch)." }
-            catch { Write-OgHostLine "Could not start the game ($launch): $($_.Exception.Message). Start it yourself." 'Yellow' }
+        $choice = Resolve-OgHostClientLaunch -Settings $Settings -Root $Root
+        if (-not $choice.Target) {
+            Write-OgHostLine "Not starting the game automatically: $(@($choice.Reasons) -join '; '). Start it yourself." 'Yellow'
         }
         else {
-            $path = [System.IO.Path]::GetFullPath((Join-Path $Root $launch))
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-                Write-OgHostLine "The game was not found at '$path'. Start it yourself." 'Yellow'
+            $target = $choice.Target
+            $answer = [string](Read-OgHostAnswer -Prompt 'Start the game on this PC now? [Y/n]')
+            if ($answer.Trim() -match '^(n|no)$') {
+                Write-OgHostLine 'OK, start the game yourself when you want to play on this PC.'
             }
             else {
-                try { Start-OgHostClientLaunch -Target $path -WorkingDirectory (Split-Path -Parent $path); Write-OgHostLine "Starting the game ($path)." }
-                catch { Write-OgHostLine "Could not start the game ($path): $($_.Exception.Message). Start it yourself." 'Yellow' }
+                try {
+                    if ($choice.WorkingDirectory) { Start-OgHostClientLaunch -Target $target -WorkingDirectory $choice.WorkingDirectory }
+                    else { Start-OgHostClientLaunch -Target $target }
+                    Write-OgHostLine "Starting the game ($target)."
+                }
+                catch { Write-OgHostLine "Could not start the game ($target): $($_.Exception.Message). Start it yourself." 'Yellow' }
             }
         }
     }

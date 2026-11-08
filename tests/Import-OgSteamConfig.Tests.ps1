@@ -12,7 +12,8 @@ BeforeAll {
         if ($null -eq $Value) { return '$null' }
         if ($Value -is [System.Collections.IDictionary]) {
             $lines = foreach ($key in $Value.Keys) {
-                "$pad$key = $(ConvertTo-TestPsd1Text $Value[$key] ($Depth + 1))"
+                $name = if ($key -match '^[A-Za-z_][A-Za-z0-9_]*$') { $key } else { "'$key'" }
+                "$pad$name = $(ConvertTo-TestPsd1Text $Value[$key] ($Depth + 1))"
             }
             return "@{`n$($lines -join "`n")`n$end}"
         }
@@ -236,7 +237,8 @@ Describe 'Import-OgSteamConfig' {
         }
 
         It 'rejects SchemaVersion <Value>' -TestCases @(
-            @{ Value = 2; Mutate = { param($t) $t.SchemaVersion = 2 } }
+            @{ Value = 3; Mutate = { param($t) $t.SchemaVersion = 3 } }
+            @{ Value = 0; Mutate = { param($t) $t.SchemaVersion = 0 } }
             @{ Value = "'1'"; Mutate = { param($t) $t.SchemaVersion = '1' } }
         ) {
             $path = Write-TestSteamConfig $Mutate
@@ -359,6 +361,30 @@ Describe 'Assert-OgSteamUploadReady' {
         $err.Exception.Message | Should -BeLike "*Depot 'server-win64': DepotId is the placeholder 0*"
     }
 
+    It 'S2: with -DepotNames, an unselected app may keep placeholder IDs' {
+        $config = New-TestReadyConfig
+        $config.Apps[1].AppId = [uint32]0
+        $config.Apps[1].Depots[0].DepotId = [uint32]0
+        { Assert-TestUploadReady $config @{ DepotNames = @('CLIENT-WIN64') } } | Should -Not -Throw
+        { Assert-TestUploadReady $config } | Should -Throw "*App 'server': AppId is the placeholder 0*"
+    }
+
+    It 'S2: with -DepotNames, a selected placeholder DepotId and its app are still rejected' {
+        $config = New-TestReadyConfig
+        $config.Apps[1].AppId = [uint32]0
+        $config.Apps[1].Depots[0].DepotId = [uint32]0
+        $err = { Assert-TestUploadReady $config @{ DepotNames = @('server-win64') } } | Should -Throw -PassThru
+        $err.Exception.Message | Should -BeLike "*App 'server': AppId is the placeholder 0*"
+        $err.Exception.Message | Should -BeLike "*Depot 'server-win64': DepotId is the placeholder 0*"
+        $err.Exception.Message | Should -Not -BeLike "*client*"
+    }
+
+    It 'S2: with -DepotNames, a duplicate real ID in an unselected app is still rejected' {
+        $config = New-TestReadyConfig
+        $config.Apps[1].Depots[0].DepotId = [uint32]1001
+        { Assert-TestUploadReady $config @{ DepotNames = @('client-win64') } } | Should -Throw "*DepotId 1001 is also used by depot 'client-win64'*"
+    }
+
     It 'S2: rejects a single remaining placeholder DepotId' {
         $config = New-TestReadyConfig
         $config.Apps[1].Depots[0].DepotId = [uint32]0
@@ -431,9 +457,24 @@ Describe 'Import-OgSteamConfig ServerLauncher' {
         $launcher.Port | Should -Be 7777
         $launcher.Port | Should -BeOfType [int]
         $launcher.JoinLinePattern | Should -Match '\(\?<joined>'
-        foreach ($key in 'ServerArguments', 'ReadyLinePattern', 'ClientLaunch', 'LocalHint') {
+        foreach ($key in 'ServerArguments', 'ReadyLinePattern', 'LocalHint') {
             $launcher.$key | Should -BeExactly '' -Because "$key is optional"
         }
+        , $launcher.ClientLaunch | Should -BeOfType [string[]]
+        $launcher.ClientLaunch.Count | Should -Be 0 -Because 'ClientLaunch is optional'
+    }
+
+    It 'reads ClientLaunch <Case> as a list of <Count>' -TestCases @(
+        @{ Case = "''"; Value = ''; Count = 0 }
+        @{ Case = 'an empty list'; Value = @(); Count = 0 }
+        @{ Case = 'one string'; Value = '..\GameClient.exe'; Count = 1 }
+        @{ Case = 'a list'; Value = @('..\GameClient.exe', 'steam://rungameid/{AppId:client}'); Count = 2 }
+    ) {
+        $v = $Value
+        $launcher = (Import-TestSteamConfig (Write-TestLauncherConfig { param($t, $l) $l.ClientLaunch = $v }.GetNewClosure())).Apps[1].Depots[0].ServerLauncher
+        , $launcher.ClientLaunch | Should -BeOfType [string[]]
+        $launcher.ClientLaunch.Count | Should -Be $Count
+        if ($Count -gt 0) { $launcher.ClientLaunch | Should -Be @($Value) }
     }
 
     It 'keeps every optional value, including an {AppId:<name>} token of an app in the file' {
@@ -463,6 +504,10 @@ Describe 'Import-OgSteamConfig ServerLauncher' {
         @{ Case = 'an invalid ReadyLinePattern'; Mutate = { param($t, $l) $l.ReadyLinePattern = '[' }; Message = "*'Apps[1].Depots[0].ServerLauncher.ReadyLinePattern' is not a valid regular expression*" }
         @{ Case = 'a token naming an unknown app'; Mutate = { param($t, $l) $l.ClientLaunch = 'steam://rungameid/{AppId:game}' }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch' references unknown app 'game'*Known apps: client, server*" }
         @{ Case = 'an absolute ClientLaunch path'; Mutate = { param($t, $l) $l.ClientLaunch = 'C:\Games\GameClient.exe' }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch' must be a URI or a path relative*" }
+        @{ Case = 'a ClientLaunch list entry naming an unknown app'; Mutate = { param($t, $l) $l.ClientLaunch = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}') }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch[1]' references unknown app 'game'*" }
+        @{ Case = 'an absolute ClientLaunch list entry'; Mutate = { param($t, $l) $l.ClientLaunch = @('C:\Games\GameClient.exe', 'steam://rungameid/{AppId:client}') }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch[0]' must be a URI or a path relative*" }
+        @{ Case = 'an empty ClientLaunch list entry'; Mutate = { param($t, $l) $l.ClientLaunch = @('..\GameClient.exe', '') }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch[1]' must not be empty*" }
+        @{ Case = 'a ClientLaunch list entry that is not a string'; Mutate = { param($t, $l) $l.ClientLaunch = @('..\GameClient.exe', 5) }; Message = "*'Apps[1].Depots[0].ServerLauncher.ClientLaunch[1]' must be a string*" }
         @{ Case = 'a Title with a double quote'; Mutate = { param($t, $l) $l.Title = 'A "B"' }; Message = "*'Apps[1].Depots[0].ServerLauncher.Title' must not contain a double quote*" }
         @{ Case = 'a ServerLauncher on a Client depot'; Mutate = { param($t, $l) $t.Apps[1].Depots[0].TargetType = 'Client' }; Message = "*'Apps[1].Depots[0].ServerLauncher' needs TargetType Server or Game, got 'Client'*" }
         @{ Case = 'a ServerLauncher without ExpectedExecutable'; Mutate = { param($t, $l) $t.Apps[1].Depots[0].Remove('ExpectedExecutable') }; Message = "*'Apps[1].Depots[0].ServerLauncher' needs 'Apps[1].Depots[0].ExpectedExecutable'*" }
@@ -475,5 +520,267 @@ Describe 'Import-OgSteamConfig ServerLauncher' {
     It 'accepts a ServerLauncher on a Game depot' {
         $launcher = (Import-TestSteamConfig (Write-TestLauncherConfig { param($t, $l) $t.Apps[1].Depots[0].TargetType = 'Game' })).Apps[1].Depots[0].ServerLauncher
         $launcher.Title | Should -BeExactly 'Game server'
+    }
+}
+
+Describe 'Import-OgSteamConfig schema version 2' {
+
+    BeforeAll {
+        function New-TestV2Table {
+            [ordered]@{
+                SchemaVersion  = 2
+                ProjectFile    = '..\Game\Game.uproject'
+                Platform       = 'Win64'
+                BuilderAccount = ''
+                Branch         = 'playtest'
+                OutputRoot     = '..\Game\Saved\Steam\Builds'
+                KeepLast       = 3
+                Builds         = @(
+                    [ordered]@{
+                        Name               = 'client'
+                        TargetType         = 'Client'
+                        Configuration      = 'Shipping'
+                        ExpectedExecutable = 'GameClient.exe'
+                        FileExclusions     = @('*.pdb', 'Manifest_*.txt')
+                    }
+                    [ordered]@{
+                        Name               = 'server'
+                        TargetType         = 'Server'
+                        Configuration      = 'Shipping'
+                        ExpectedExecutable = 'GameServer.exe'
+                        FileExclusions     = @('*.pdb', 'HostLogs\*')
+                        ExtraFiles         = @([ordered]@{ Source = '..\Game\run_server_template.bat'; Destination = 'run_server.bat' })
+                        ServerLauncher     = [ordered]@{
+                            Title           = 'Game server'
+                            Port            = 7777
+                            JoinLinePattern = 'S: (?:(?<joined>joined)|(?<left>left)) players=(?<players>\d+)'
+                            ClientLaunch    = @('..\GameClient.exe', 'steam://rungameid/{AppId:game}')
+                        }
+                    }
+                )
+                Apps           = @(
+                    [ordered]@{
+                        Name   = 'game'
+                        AppId  = 0
+                        Depots = @(
+                            [ordered]@{ Name = 'game-client'; DepotId = 0; Build = 'client' }
+                            [ordered]@{ Name = 'game-server'; DepotId = 0; Build = 'server'; DepotPath = 'Server' }
+                        )
+                    }
+                    [ordered]@{
+                        Name   = 'server-tool'
+                        AppId  = 0
+                        Depots = @(
+                            [ordered]@{ Name = 'tool-server'; DepotId = 0; Build = 'server' }
+                        )
+                    }
+                )
+                Profiles       = [ordered]@{
+                    Default         = 'playtest'
+                    'playtest'      = @('game-client', 'game-server')
+                    'playtest-tool' = @('game-client', 'game-server', 'tool-server')
+                    'game-only'     = 'game-client'
+                }
+            }
+        }
+
+        function Write-TestV2Config {
+            param([scriptblock] $Mutate)
+            $table = New-TestV2Table
+            if ($Mutate) { & $Mutate $table }
+            $path = Join-Path $TestDrive 'config\steam-publish.psd1'
+            Set-Content -LiteralPath $path -Value (ConvertTo-TestPsd1Text $table) -Encoding utf8
+            $path
+        }
+
+        function Get-TestThrowPattern {
+            param([string] $Message)
+            $Message.Replace('[', '`[').Replace(']', '`]')
+        }
+    }
+
+    Context 'A fully valid version 2 config' {
+
+        BeforeAll {
+            $config = Import-TestSteamConfig (Write-TestV2Config)
+        }
+
+        It 'returns the builds with their keys and absolute ExtraFiles sources' {
+            $config.SchemaVersion | Should -Be 2
+            @($config.Builds | ForEach-Object Name) | Should -Be @('client', 'server')
+            $server = $config.Builds[1]
+            $server | Should -BeOfType [pscustomobject]
+            $server.TargetType | Should -Be 'Server'
+            $server.Configuration | Should -Be 'Shipping'
+            $server.ExpectedExecutable | Should -Be 'GameServer.exe'
+            $server.FileExclusions | Should -Be @('*.pdb', 'HostLogs\*')
+            $server.ExtraFiles[0].Source | Should -Be (Join-Path $TestDrive 'Game\run_server_template.bat')
+            $server.ServerLauncher.Title | Should -BeExactly 'Game server'
+            $server.ServerLauncher.ClientLaunch | Should -Be @('..\GameClient.exe', 'steam://rungameid/{AppId:game}')
+            $config.Builds[0].ServerLauncher | Should -BeNullOrEmpty
+        }
+
+        It 'gives every depot its build, its DepotPath and its build''s keys' {
+            $client = $config.Apps[0].Depots[0]
+            $client.Name | Should -Be 'game-client'
+            $client.Build | Should -Be 'client'
+            $client.DepotPath | Should -Be '.'
+            $client.TargetType | Should -Be 'Client'
+            $client.ExpectedExecutable | Should -Be 'GameClient.exe'
+            $client.AppName | Should -Be 'game'
+
+            $gameServer = $config.Apps[0].Depots[1]
+            $gameServer.Build | Should -Be 'server'
+            $gameServer.DepotPath | Should -Be 'Server'
+            $gameServer.FileExclusions | Should -Be @('*.pdb', 'HostLogs\*')
+
+            $toolServer = $config.Apps[1].Depots[0]
+            $toolServer.Build | Should -Be 'server'
+            $toolServer.DepotPath | Should -Be '.'
+            $toolServer.AppName | Should -Be 'server-tool'
+            [object]::ReferenceEquals($toolServer.ServerLauncher, $gameServer.ServerLauncher) | Should -BeTrue
+        }
+
+        It 'returns the profiles sorted by name and the default profile' {
+            @($config.Profiles | ForEach-Object Name) | Should -Be @('game-only', 'playtest', 'playtest-tool')
+            ($config.Profiles | Where-Object Name -EQ 'playtest-tool').Depots | Should -Be @('game-client', 'game-server', 'tool-server')
+            , ($config.Profiles | Where-Object Name -EQ 'game-only').Depots | Should -BeOfType [string[]]
+            ($config.Profiles | Where-Object Name -EQ 'game-only').Depots | Should -Be @('game-client')
+            $config.DefaultProfile | Should -BeExactly 'playtest'
+        }
+
+        It 'matches build, depot and profile references case-insensitively and returns the defined casing' {
+            $c = Import-TestSteamConfig (Write-TestV2Config {
+                    param($t)
+                    $t.Apps[0].Depots[1].Build = 'SERVER'
+                    $t.Profiles.'game-only' = @('Game-Client', 'game-client')
+                    $t.Profiles.Default = 'PlayTest'
+                })
+            $c.Apps[0].Depots[1].Build | Should -BeExactly 'server'
+            ($c.Profiles | Where-Object Name -EQ 'game-only').Depots | Should -Be @('game-client')
+            $c.DefaultProfile | Should -BeExactly 'playtest'
+        }
+
+        It 'accepts a version 2 config without Profiles' {
+            $c = Import-TestSteamConfig (Write-TestV2Config { param($t) $t.Remove('Profiles') })
+            @($c.Profiles).Count | Should -Be 0
+            $c.DefaultProfile | Should -BeExactly ''
+        }
+
+        It 'warns about a build that no depot uses, without failing' {
+            $path = Write-TestV2Config {
+                param($t)
+                $t.Builds += [ordered]@{ Name = 'spare'; TargetType = 'Game'; Configuration = 'Development' }
+            }
+            $output = @(InModuleScope og-framework -Parameters @{ Path = $path } {
+                    param($Path)
+                    Import-OgSteamConfig -Path $Path 3>&1
+                })
+            $warnings = @($output | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+            $c = @($output | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] })[0]
+            $c.Builds.Count | Should -Be 3
+            $warnings.Count | Should -Be 1
+            $warnings[0].Message | Should -Match "build 'spare' \(Builds\[2\]\) is not used by any depot"
+            $quiet = @(InModuleScope og-framework -Parameters @{ Path = (Write-TestV2Config) } {
+                    param($Path)
+                    Import-OgSteamConfig -Path $Path 3>&1
+                })
+            @($quiet | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Count | Should -Be 0
+        }
+
+        It 'normalises DepotPath <Given> to <Expected>' -TestCases @(
+            @{ Given = 'Server'; Expected = 'Server' }
+            @{ Given = 'Server/Bin'; Expected = 'Server\Bin' }
+            @{ Given = '.\Server\'; Expected = 'Server' }
+            @{ Given = 'Server//Bin/./x'; Expected = 'Server\Bin\x' }
+            @{ Given = '.'; Expected = '.' }
+            @{ Given = './'; Expected = '.' }
+        ) {
+            $g = $Given
+            $c = Import-TestSteamConfig (Write-TestV2Config { param($t) $t.Apps[0].Depots[1].DepotPath = $g }.GetNewClosure())
+            $c.Apps[0].Depots[1].DepotPath | Should -BeExactly $Expected
+        }
+    }
+
+    Context 'Version 1 configs' {
+
+        It 'turns each version 1 depot into a build named after it with DepotPath .' {
+            $c = Import-TestSteamConfig (Write-TestSteamConfig)
+            @($c.Builds | ForEach-Object Name) | Should -Be @('client-win64', 'server-win64')
+            $c.Builds[1].ExtraFiles[0].Destination | Should -Be 'run_server.bat'
+            foreach ($depot in @($c.Apps | ForEach-Object { $_.Depots })) {
+                $depot.Build | Should -BeExactly $depot.Name
+                $depot.DepotPath | Should -BeExactly '.'
+            }
+            @($c.Profiles).Count | Should -Be 0
+            $c.DefaultProfile | Should -BeExactly ''
+        }
+
+        It 'rejects the version 2 key <Key> in a version 1 config' -TestCases @(
+            @{ Key = 'Profiles'; Mutate = { param($t) $t.Profiles = @{ Default = 'x'; x = @('client-win64') } } }
+            @{ Key = 'Builds'; Mutate = { param($t) $t.Builds = @() } }
+            @{ Key = 'Apps[0].Depots[0].DepotPath'; Mutate = { param($t) $t.Apps[0].Depots[0].DepotPath = 'Server' } }
+            @{ Key = 'Apps[0].Depots[0].Build'; Mutate = { param($t) $t.Apps[0].Depots[0].Build = 'client' } }
+        ) {
+            $path = Write-TestSteamConfig $Mutate
+            { Import-TestSteamConfig $path } | Should -Throw "*unknown key '$([WildcardPattern]::Escape($Key))'*"
+        }
+    }
+
+    Context 'Version 2 rejections, each naming the offending key' {
+
+        It 'rejects <Case>' -TestCases @(
+            @{ Case = 'a missing Builds'; Mutate = { param($t) $t.Remove('Builds') }; Message = "*missing required key 'Builds'*" }
+            @{ Case = 'an empty Builds'; Mutate = { param($t) $t.Builds = @() }; Message = "*'Builds' must contain at least one build*" }
+            @{ Case = 'an unknown top-level key'; Mutate = { param($t) $t.Profile = 'x' }; Message = "*unknown key 'Profile'*" }
+            @{ Case = 'a build that is not a hashtable'; Mutate = { param($t) $t.Builds = @('client') }; Message = "*'Builds[0]' must be a hashtable*" }
+            @{ Case = 'an unknown build key'; Mutate = { param($t) $t.Builds[0].DepotId = 5 }; Message = "*unknown key 'Builds[0].DepotId'*" }
+            @{ Case = 'a build without Name'; Mutate = { param($t) $t.Builds[0].Remove('Name') }; Message = "*missing required key 'Builds[0].Name'*" }
+            @{ Case = 'a build without TargetType'; Mutate = { param($t) $t.Builds[1].Remove('TargetType') }; Message = "*missing required key 'Builds[1].TargetType'*" }
+            @{ Case = 'a build name with capitals'; Mutate = { param($t) $t.Builds[0].Name = 'Client'; $t.Apps[0].Depots[0].Build = 'Client' }; Message = "*'Builds[0].Name' must match*" }
+            @{ Case = 'a duplicate build name'; Mutate = { param($t) $t.Builds[1].Name = 'client' }; Message = "*duplicate build name 'client' at 'Builds[1].Name'*" }
+            @{ Case = 'a bad build TargetType'; Mutate = { param($t) $t.Builds[0].TargetType = 'Editor' }; Message = "*'Builds[0].TargetType' must be one of*" }
+            @{ Case = 'a ServerLauncher on a Client build'; Mutate = { param($t) $t.Builds[0].ServerLauncher = $t.Builds[1].ServerLauncher }; Message = "*'Builds[0].ServerLauncher' needs TargetType Server or Game*" }
+            @{ Case = 'a build ExtraFiles Destination outside the content root'; Mutate = { param($t) $t.Builds[1].ExtraFiles[0].Destination = '..\x.bat' }; Message = "*'Builds[1].ExtraFiles[0].Destination' must be a path inside*" }
+            @{ Case = 'a build key on a version 2 depot'; Mutate = { param($t) $t.Apps[0].Depots[0].TargetType = 'Client' }; Message = "*unknown key 'Apps[0].Depots[0].TargetType'*" }
+            @{ Case = 'a depot without Build'; Mutate = { param($t) $t.Apps[0].Depots[0].Remove('Build') }; Message = "*missing required key 'Apps[0].Depots[0].Build'*" }
+            @{ Case = 'a depot naming an unknown build'; Mutate = { param($t) $t.Apps[1].Depots[0].Build = 'dedicated' }; Message = "*'Apps[1].Depots[0].Build' names unknown build 'dedicated'. Builds: client, server*" }
+            @{ Case = 'a duplicate depot name across apps'; Mutate = { param($t) $t.Apps[1].Depots[0].Name = 'game-server' }; Message = "*duplicate depot name 'game-server' at 'Apps[1].Depots[0].Name'*" }
+            @{ Case = 'a ClientLaunch token naming an unknown app'; Mutate = { param($t) $t.Builds[1].ServerLauncher.ClientLaunch = @('steam://rungameid/{AppId:client}') }; Message = "*'Builds[1].ServerLauncher.ClientLaunch' references unknown app 'client'*" }
+            @{ Case = 'Profiles that is not a hashtable'; Mutate = { param($t) $t.Profiles = @('playtest') }; Message = "*'Profiles' must be a hashtable*" }
+            @{ Case = 'Profiles without Default'; Mutate = { param($t) $t.Profiles.Remove('Default') }; Message = "*missing required key 'Profiles.Default'*" }
+            @{ Case = 'a Default naming an unknown profile'; Mutate = { param($t) $t.Profiles.Default = 'release' }; Message = "*'Profiles.Default' names unknown profile 'release'. Profiles: game-only, playtest, playtest-tool*" }
+            @{ Case = 'a Default that is not a string'; Mutate = { param($t) $t.Profiles.Default = @('playtest') }; Message = "*'Profiles.Default' must be a string*" }
+            @{ Case = 'a profile entry naming an unknown depot'; Mutate = { param($t) $t.Profiles.'playtest-tool' = @('game-client', 'tool-servr') }; Message = "*'Profiles.playtest-tool[1]' names unknown depot 'tool-servr'*" }
+            @{ Case = 'an empty profile'; Mutate = { param($t) $t.Profiles.'game-only' = @() }; Message = "*'Profiles.game-only' must name at least one depot*" }
+            @{ Case = 'a profile name with capitals'; Mutate = { param($t) $t.Profiles.Release = @('game-client') }; Message = "*must match ^[a-z0-9-]+$, got 'Release'*" }
+        ) {
+            $path = Write-TestV2Config $Mutate
+            { Import-TestSteamConfig $path } | Should -Throw (Get-TestThrowPattern $Message)
+        }
+
+        It 'rejects DepotPath <Given> (<Why>)' -TestCases @(
+            @{ Given = '..'; Why = 'parent folder'; Message = "*'Apps[0].Depots[1].DepotPath' must not contain a '..' segment*" }
+            @{ Given = 'Server\..\..\Other'; Why = 'parent segment inside'; Message = "*'Apps[0].Depots[1].DepotPath' must not contain a '..' segment*" }
+            @{ Given = 'Server/../x'; Why = 'parent segment with /'; Message = "*'Apps[0].Depots[1].DepotPath' must not contain a '..' segment*" }
+            @{ Given = 'C:\Server'; Why = 'drive root'; Message = "*'Apps[0].Depots[1].DepotPath' must be a relative path*" }
+            @{ Given = 'C:Server'; Why = 'drive-relative'; Message = "*'Apps[0].Depots[1].DepotPath' must be a relative path*" }
+            @{ Given = '\Server'; Why = 'rooted'; Message = "*'Apps[0].Depots[1].DepotPath' must be a relative path*" }
+            @{ Given = '/Server'; Why = 'rooted with /'; Message = "*'Apps[0].Depots[1].DepotPath' must be a relative path*" }
+            @{ Given = '\\host\share'; Why = 'UNC'; Message = "*'Apps[0].Depots[1].DepotPath' must be a relative path*" }
+            @{ Given = 'Server\*'; Why = 'wildcard *'; Message = "*'Apps[0].Depots[1].DepotPath' must not contain a wildcard*" }
+            @{ Given = 'Serv?r'; Why = 'wildcard ?'; Message = "*'Apps[0].Depots[1].DepotPath' must not contain a wildcard*" }
+            @{ Given = 'Ser|ver'; Why = 'invalid character'; Message = "*'Apps[0].Depots[1].DepotPath' holds a character a folder name cannot hold*" }
+            @{ Given = ''; Why = 'empty'; Message = "*'Apps[0].Depots[1].DepotPath' must not be empty*" }
+        ) {
+            $g = $Given
+            $path = Write-TestV2Config { param($t) $t.Apps[0].Depots[1].DepotPath = $g }.GetNewClosure()
+            { Import-TestSteamConfig $path } | Should -Throw (Get-TestThrowPattern $Message)
+        }
+
+        It 'rejects a DepotPath that is not a string' {
+            $path = Write-TestV2Config { param($t) $t.Apps[0].Depots[1].DepotPath = 5 }
+            { Import-TestSteamConfig $path } | Should -Throw (Get-TestThrowPattern "*'Apps[0].Depots[1].DepotPath' must be a string*")
+        }
     }
 }

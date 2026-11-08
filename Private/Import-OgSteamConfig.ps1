@@ -6,7 +6,35 @@ function Import-OgSteamConfig {
         Loads and validates a Steam publish config (.psd1) and returns it with absolute paths.
 
     .DESCRIPTION
-        Reads the file with Import-PowerShellDataFile and validates it against schema version 1:
+        Reads the file with Import-PowerShellDataFile and validates it against schema version 1
+        or 2.
+
+        Schema version 2 separates what is packaged (Builds) from where it goes (the depots of
+        each app), so one packaged build can feed several depots:
+
+            SchemaVersion  = 2                  (required)
+            ProjectFile, EngineRoot, Platform, BuilderAccount, Branch, OutputRoot, KeepLast
+                                                (as in version 1, below)
+            Builds         = @( @{ Name; TargetType; Configuration;
+                                 ExpectedExecutable; FileExclusions;
+                                 ExtraFiles = @( @{ Source; Destination } );
+                                 ServerLauncher = @{ ... } } )
+            Apps           = @( @{ Name; AppId; Depots = @( @{ Name; DepotId; Build; DepotPath } ) } )
+            Profiles       = @{ Default = '<profile>'; <profile> = @('<depot>', ...); ... }   (optional)
+
+        Build keys Name, TargetType and Configuration are required; ExpectedExecutable,
+        FileExclusions, ExtraFiles and ServerLauncher are optional. Build names match
+        ^[a-z0-9-]+$ and are unique. Depot keys Name, DepotId and Build are required; Build names
+        a build of this file. DepotPath (optional, default '.') is the folder inside the app
+        install that the build lands in: a relative path with no '..' segment, no wildcard and
+        no character a file name cannot hold; '\' and '/' are both accepted and returned as '\'.
+        A build that no depot uses only produces a warning.
+
+        Profiles (optional) names sets of depots for Publish-OgSteamBuild -Profile. Default is
+        required when Profiles is present and names one of the profiles; every other key is a
+        profile name (^[a-z0-9-]+$) whose value lists one or more depot names of this file.
+
+        Schema version 1 keeps every build key on the depot itself:
 
             SchemaVersion  = 1                  (required)
             ProjectFile    = '<rel or abs>.uproject'   (required, must exist)
@@ -23,16 +51,20 @@ function Import-OgSteamConfig {
                                  ServerLauncher = @{ Title; Port; JoinLinePattern;
                                      ServerArguments; ReadyLinePattern; ClientLaunch; LocalHint } } ) } )
 
-        App keys Name, AppId, Depots are required. Depot keys Name, DepotId, TargetType and
-        Configuration are required; ExpectedExecutable, FileExclusions, ExtraFiles and
-        ServerLauncher are optional.
+        Each version 1 depot becomes an implicit build named after the depot, with DepotPath '.'.
+        Builds, Profiles and DepotPath are version 2 keys and are unknown in version 1.
+
+        App keys Name, AppId, Depots are required. Depot names match ^[a-z0-9-]+$ and are unique
+        across all apps. References to builds and depots match case-insensitively and are
+        returned in the casing of their definition.
 
         ServerLauncher (optional) makes Publish-OgSteamBuild generate a dedicated-server host
-        launcher into the depot (New-OgDedicatedServerLauncher). It needs TargetType Server or Game
-        and an ExpectedExecutable. Title, Port and JoinLinePattern are required; ServerArguments,
-        ReadyLinePattern, ClientLaunch and LocalHint are optional and default to ''. The values are
-        checked by Assert-OgServerLauncherSettings; {AppId:<name>} tokens in ClientLaunch must name
-        an app of this file.
+        launcher into the build (New-OgDedicatedServerLauncher). It needs TargetType Server or
+        Game and an ExpectedExecutable. Title, Port and JoinLinePattern are required;
+        ServerArguments, ReadyLinePattern, ClientLaunch and LocalHint are optional. ClientLaunch
+        is one string or a list of them (the launcher starts the first usable one); a list entry
+        must not be empty. The values are checked by Assert-OgServerLauncherSettings;
+        {AppId:<name>} tokens in ClientLaunch must name an app of this file.
         Unknown keys at any level are rejected so a misspelt key never passes silently.
 
         AppId and DepotId must be non-negative integers that fit a uint32; 0 is accepted here as a
@@ -49,10 +81,16 @@ function Import-OgSteamConfig {
         $config.Apps[0].Depots[0].DepotId
 
     .OUTPUTS
-        PSCustomObject with ConfigPath plus every schema key. Apps is an array of PSCustomObjects
-        (Name, AppId, Depots); each depot carries AppName and AppId back-references and its
+        PSCustomObject with ConfigPath plus every schema key:
+          - Builds: PSCustomObjects (Name, TargetType, Configuration, ExpectedExecutable,
+            FileExclusions, ExtraFiles, ServerLauncher); one per version 1 depot.
+          - Apps: PSCustomObjects (Name, AppId, Depots). Each depot carries Name, DepotId, Build,
+            DepotPath, its build's TargetType, Configuration, ExpectedExecutable, FileExclusions,
+            ExtraFiles and ServerLauncher, and AppName and AppId back-references.
+          - Profiles: PSCustomObjects (Name, Depots), sorted by name; empty without Profiles.
+          - DefaultProfile: the Default profile name, or ''.
         ExtraFiles entries carry an absolute Source. ServerLauncher is $null or a PSCustomObject
-        with all seven keys.
+        with all seven keys; its ClientLaunch is a string array (empty when unset).
     #>
     [CmdletBinding()]
     param(
@@ -128,20 +166,161 @@ function Import-OgSteamConfig {
         , @($Value)
     }
 
+    $asName = {
+        param($Value, [string] $Key)
+        $text = & $asString $Value $Key
+        if ($text -cnotmatch '^[a-z0-9-]+$') {
+            throw "Steam config '$configPath': '$Key' must match ^[a-z0-9-]+$, got '$text'."
+        }
+        $text
+    }
+
     $resolve = {
         param([string] $Relative)
         [System.IO.Path]::GetFullPath($Relative, $configDir)
     }
 
-    $uint32Max = [long][uint32]::MaxValue
+    $asDepotPath = {
+        param($Value, [string] $Key)
+        $text = & $asString $Value $Key
+        if ([System.IO.Path]::IsPathRooted($text)) {
+            throw "Steam config '$configPath': '$Key' must be a relative path inside the app install, got '$text'."
+        }
+        $segments = @($text -split '[\\/]' | Where-Object { $_ -ne '' -and $_ -ne '.' })
+        if ($segments -contains '..') {
+            throw "Steam config '$configPath': '$Key' must not contain a '..' segment, got '$text'."
+        }
+        if ($text.IndexOfAny([char[]]'*?') -ge 0) {
+            throw "Steam config '$configPath': '$Key' must not contain a wildcard (* or ?), got '$text'."
+        }
+        $invalid = [System.IO.Path]::GetInvalidFileNameChars()
+        foreach ($segment in $segments) {
+            if ($segment.IndexOfAny($invalid) -ge 0) {
+                throw "Steam config '$configPath': '$Key' holds a character a folder name cannot hold, got '$text'."
+            }
+        }
+        if ($segments.Count -eq 0) { return '.' }
+        $segments -join '\'
+    }
 
-    & $assertKeys $raw '' `
-        @('SchemaVersion', 'ProjectFile', 'Platform', 'OutputRoot', 'KeepLast', 'Apps') `
-        @('EngineRoot', 'BuilderAccount', 'Branch')
+    $readBuild = {
+        param([System.Collections.IDictionary] $Table, [string] $Where, [string] $Name, [string[]] $AppNames)
+        $targetType = & $asChoice $Table.TargetType "${Where}TargetType" @('Client', 'Server', 'Game')
+        $configuration = & $asChoice $Table.Configuration "${Where}Configuration" @('Development', 'Shipping')
+
+        $expectedExecutable = & $asString $Table.ExpectedExecutable "${Where}ExpectedExecutable" -AllowEmpty
+        if ($expectedExecutable -ne '' -and [System.IO.Path]::IsPathRooted($expectedExecutable)) {
+            throw "Steam config '$configPath': '${Where}ExpectedExecutable' must be relative to the depot content root, got '$expectedExecutable'."
+        }
+
+        $exclusions = & $asList $Table.FileExclusions "${Where}FileExclusions"
+        $fileExclusions = [string[]]@(for ($x = 0; $x -lt $exclusions.Count; $x++) {
+                & $asString $exclusions[$x] "${Where}FileExclusions[$x]"
+            })
+
+        $rawExtras = & $asList $Table.ExtraFiles "${Where}ExtraFiles"
+        $extraFiles = @(for ($e = 0; $e -lt $rawExtras.Count; $e++) {
+                $extraWhere = "${Where}ExtraFiles[$e]."
+                $rawExtra = $rawExtras[$e]
+                if ($rawExtra -isnot [System.Collections.IDictionary]) {
+                    throw "Steam config '$configPath': '${Where}ExtraFiles[$e]' must be a hashtable."
+                }
+                & $assertKeys $rawExtra $extraWhere @('Source', 'Destination') @()
+
+                $source = & $resolve (& $asString $rawExtra.Source "${extraWhere}Source")
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                    throw "Steam config '$configPath': '${extraWhere}Source' '$source' does not exist."
+                }
+                $destination = & $asString $rawExtra.Destination "${extraWhere}Destination"
+                if ([System.IO.Path]::IsPathRooted($destination) -or
+                    ($destination -split '[\\/]') -contains '..') {
+                    throw "Steam config '$configPath': '${extraWhere}Destination' must be a path inside the depot content root, got '$destination'."
+                }
+
+                [pscustomobject]@{
+                    Source      = $source
+                    Destination = $destination
+                }
+            })
+
+        $serverLauncher = $null
+        if ($Table.Contains('ServerLauncher')) {
+            $launcherWhere = "${Where}ServerLauncher."
+            $rawLauncher = $Table.ServerLauncher
+            if ($rawLauncher -isnot [System.Collections.IDictionary]) {
+                throw "Steam config '$configPath': '${Where}ServerLauncher' must be a hashtable."
+            }
+            & $assertKeys $rawLauncher $launcherWhere `
+                @('Title', 'Port', 'JoinLinePattern') `
+                @('ServerArguments', 'ReadyLinePattern', 'ClientLaunch', 'LocalHint')
+            if ($targetType -eq 'Client') {
+                throw "Steam config '$configPath': '${Where}ServerLauncher' needs TargetType Server or Game, got '$targetType'."
+            }
+            if ($expectedExecutable -eq '') {
+                throw "Steam config '$configPath': '${Where}ServerLauncher' needs '${Where}ExpectedExecutable' (the server exe the launcher starts)."
+            }
+
+            $rawLaunch = $rawLauncher.ClientLaunch
+            if ($null -eq $rawLaunch -or $rawLaunch -is [string]) {
+                $single = & $asString $rawLaunch "${launcherWhere}ClientLaunch" -AllowEmpty
+                [string[]]$clientLaunch = @($single | Where-Object { $_ -ne '' })
+            }
+            else {
+                $entries = @($rawLaunch)
+                [string[]]$clientLaunch = @(for ($c = 0; $c -lt $entries.Count; $c++) {
+                        & $asString $entries[$c] "${launcherWhere}ClientLaunch[$c]"
+                    })
+            }
+
+            $serverLauncher = [pscustomobject]@{
+                Title            = & $asString $rawLauncher.Title "${launcherWhere}Title"
+                Port             = [int](& $asInteger $rawLauncher.Port "${launcherWhere}Port" 1 65535)
+                JoinLinePattern  = & $asString $rawLauncher.JoinLinePattern "${launcherWhere}JoinLinePattern"
+                ServerArguments  = & $asString $rawLauncher.ServerArguments "${launcherWhere}ServerArguments" -AllowEmpty
+                ReadyLinePattern = & $asString $rawLauncher.ReadyLinePattern "${launcherWhere}ReadyLinePattern" -AllowEmpty
+                ClientLaunch     = $clientLaunch
+                LocalHint        = & $asString $rawLauncher.LocalHint "${launcherWhere}LocalHint" -AllowEmpty
+            }
+            try {
+                Assert-OgServerLauncherSettings -Title $serverLauncher.Title -Port $serverLauncher.Port `
+                    -ServerArguments $serverLauncher.ServerArguments -JoinLinePattern $serverLauncher.JoinLinePattern `
+                    -ReadyLinePattern $serverLauncher.ReadyLinePattern -ClientLaunch $serverLauncher.ClientLaunch `
+                    -LocalHint $serverLauncher.LocalHint -AppNames $AppNames -Prefix $launcherWhere
+            }
+            catch {
+                throw "Steam config '$configPath': $($_.Exception.Message)"
+            }
+        }
+
+        [pscustomobject]@{
+            Name               = $Name
+            TargetType         = $targetType
+            Configuration      = $configuration
+            ExpectedExecutable = $expectedExecutable
+            FileExclusions     = $fileExclusions
+            ExtraFiles         = $extraFiles
+            ServerLauncher     = $serverLauncher
+        }
+    }
+
+    $uint32Max = [long][uint32]::MaxValue
+    $buildKeys = @('ExpectedExecutable', 'FileExclusions', 'ExtraFiles', 'ServerLauncher')
+
+    $isVersion2 = ($raw.SchemaVersion -is [int] -or $raw.SchemaVersion -is [long]) -and $raw.SchemaVersion -eq 2
+    if ($isVersion2) {
+        & $assertKeys $raw '' `
+            @('SchemaVersion', 'ProjectFile', 'Platform', 'OutputRoot', 'KeepLast', 'Builds', 'Apps') `
+            @('EngineRoot', 'BuilderAccount', 'Branch', 'Profiles')
+    }
+    else {
+        & $assertKeys $raw '' `
+            @('SchemaVersion', 'ProjectFile', 'Platform', 'OutputRoot', 'KeepLast', 'Apps') `
+            @('EngineRoot', 'BuilderAccount', 'Branch')
+    }
 
     $schemaVersion = & $asInteger $raw.SchemaVersion 'SchemaVersion' 0 ([int]::MaxValue)
-    if ($schemaVersion -ne 1) {
-        throw "Steam config '$configPath': 'SchemaVersion' must be 1, got $schemaVersion."
+    if ($schemaVersion -ne 1 -and $schemaVersion -ne 2) {
+        throw "Steam config '$configPath': 'SchemaVersion' must be 1 or 2, got $schemaVersion."
     }
 
     $projectFile = & $resolve (& $asString $raw.ProjectFile 'ProjectFile')
@@ -176,9 +355,36 @@ function Import-OgSteamConfig {
     $allAppNames = [string[]]@($rawApps | Where-Object { $_ -is [System.Collections.IDictionary] -and $_.Name -is [string] } |
             ForEach-Object { $_.Name })
 
+    $builds = [System.Collections.Generic.List[object]]::new()
+    $buildsByName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $buildWhere = @{}
+    if ($isVersion2) {
+        $rawBuilds = & $asList $raw.Builds 'Builds'
+        if ($rawBuilds.Count -eq 0) {
+            throw "Steam config '$configPath': 'Builds' must contain at least one build."
+        }
+        for ($b = 0; $b -lt $rawBuilds.Count; $b++) {
+            $where = "Builds[$b]."
+            $rawBuild = $rawBuilds[$b]
+            if ($rawBuild -isnot [System.Collections.IDictionary]) {
+                throw "Steam config '$configPath': 'Builds[$b]' must be a hashtable."
+            }
+            & $assertKeys $rawBuild $where @('Name', 'TargetType', 'Configuration') $buildKeys
+            $buildName = & $asName $rawBuild.Name "${where}Name"
+            if ($buildsByName.ContainsKey($buildName)) {
+                throw "Steam config '$configPath': duplicate build name '$buildName' at '${where}Name'."
+            }
+            $build = & $readBuild $rawBuild $where $buildName $allAppNames
+            $builds.Add($build)
+            $buildsByName[$buildName] = $build
+            $buildWhere[$buildName] = "Builds[$b]"
+        }
+    }
+
     $apps = [System.Collections.Generic.List[object]]::new()
     $appNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $depotNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $depotsByName = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $usedBuilds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     for ($a = 0; $a -lt $rawApps.Count; $a++) {
         $appWhere = "Apps[$a]."
@@ -206,105 +412,51 @@ function Import-OgSteamConfig {
             if ($rawDepot -isnot [System.Collections.IDictionary]) {
                 throw "Steam config '$configPath': '${appWhere}Depots[$d]' must be a hashtable."
             }
-            & $assertKeys $rawDepot $depotWhere `
-                @('Name', 'DepotId', 'TargetType', 'Configuration') `
-                @('ExpectedExecutable', 'FileExclusions', 'ExtraFiles', 'ServerLauncher')
-
-            $depotName = & $asString $rawDepot.Name "${depotWhere}Name"
-            if ($depotName -cnotmatch '^[a-z0-9-]+$') {
-                throw "Steam config '$configPath': '${depotWhere}Name' must match ^[a-z0-9-]+$, got '$depotName'."
+            if ($isVersion2) {
+                & $assertKeys $rawDepot $depotWhere @('Name', 'DepotId', 'Build') @('DepotPath')
             }
-            if (-not $depotNames.Add($depotName)) {
+            else {
+                & $assertKeys $rawDepot $depotWhere @('Name', 'DepotId', 'TargetType', 'Configuration') $buildKeys
+            }
+
+            $depotName = & $asName $rawDepot.Name "${depotWhere}Name"
+            if ($depotsByName.ContainsKey($depotName)) {
                 throw "Steam config '$configPath': duplicate depot name '$depotName' at '${depotWhere}Name'."
             }
-
             $depotId = [uint32](& $asInteger $rawDepot.DepotId "${depotWhere}DepotId" 0 $uint32Max)
-            $targetType = & $asChoice $rawDepot.TargetType "${depotWhere}TargetType" @('Client', 'Server', 'Game')
-            $configuration = & $asChoice $rawDepot.Configuration "${depotWhere}Configuration" @('Development', 'Shipping')
 
-            $expectedExecutable = & $asString $rawDepot.ExpectedExecutable "${depotWhere}ExpectedExecutable" -AllowEmpty
-            if ($expectedExecutable -ne '' -and [System.IO.Path]::IsPathRooted($expectedExecutable)) {
-                throw "Steam config '$configPath': '${depotWhere}ExpectedExecutable' must be relative to the depot content root, got '$expectedExecutable'."
+            if ($isVersion2) {
+                $buildRef = & $asString $rawDepot.Build "${depotWhere}Build"
+                if (-not $buildsByName.ContainsKey($buildRef)) {
+                    throw "Steam config '$configPath': '${depotWhere}Build' names unknown build '$buildRef'. Builds: $(@($builds | ForEach-Object Name) -join ', ')."
+                }
+                $build = $buildsByName[$buildRef]
+                $depotPath = if ($rawDepot.Contains('DepotPath')) { & $asDepotPath $rawDepot.DepotPath "${depotWhere}DepotPath" } else { '.' }
             }
-
-            $exclusions = & $asList $rawDepot.FileExclusions "${depotWhere}FileExclusions"
-            $fileExclusions = [string[]]@(for ($x = 0; $x -lt $exclusions.Count; $x++) {
-                    & $asString $exclusions[$x] "${depotWhere}FileExclusions[$x]"
-                })
-
-            $rawExtras = & $asList $rawDepot.ExtraFiles "${depotWhere}ExtraFiles"
-            $extraFiles = @(for ($e = 0; $e -lt $rawExtras.Count; $e++) {
-                    $extraWhere = "${depotWhere}ExtraFiles[$e]."
-                    $rawExtra = $rawExtras[$e]
-                    if ($rawExtra -isnot [System.Collections.IDictionary]) {
-                        throw "Steam config '$configPath': '${depotWhere}ExtraFiles[$e]' must be a hashtable."
-                    }
-                    & $assertKeys $rawExtra $extraWhere @('Source', 'Destination') @()
-
-                    $source = & $resolve (& $asString $rawExtra.Source "${extraWhere}Source")
-                    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-                        throw "Steam config '$configPath': '${extraWhere}Source' '$source' does not exist."
-                    }
-                    $destination = & $asString $rawExtra.Destination "${extraWhere}Destination"
-                    if ([System.IO.Path]::IsPathRooted($destination) -or
-                        ($destination -split '[\\/]') -contains '..') {
-                        throw "Steam config '$configPath': '${extraWhere}Destination' must be a path inside the depot content root, got '$destination'."
-                    }
-
-                    [pscustomobject]@{
-                        Source      = $source
-                        Destination = $destination
-                    }
-                })
-
-            $serverLauncher = $null
-            if ($rawDepot.Contains('ServerLauncher')) {
-                $launcherWhere = "${depotWhere}ServerLauncher."
-                $rawLauncher = $rawDepot.ServerLauncher
-                if ($rawLauncher -isnot [System.Collections.IDictionary]) {
-                    throw "Steam config '$configPath': '${depotWhere}ServerLauncher' must be a hashtable."
-                }
-                & $assertKeys $rawLauncher $launcherWhere `
-                    @('Title', 'Port', 'JoinLinePattern') `
-                    @('ServerArguments', 'ReadyLinePattern', 'ClientLaunch', 'LocalHint')
-                if ($targetType -eq 'Client') {
-                    throw "Steam config '$configPath': '${depotWhere}ServerLauncher' needs TargetType Server or Game, got '$targetType'."
-                }
-                if ($expectedExecutable -eq '') {
-                    throw "Steam config '$configPath': '${depotWhere}ServerLauncher' needs '${depotWhere}ExpectedExecutable' (the server exe the launcher starts)."
-                }
-                $serverLauncher = [pscustomobject]@{
-                    Title            = & $asString $rawLauncher.Title "${launcherWhere}Title"
-                    Port             = [int](& $asInteger $rawLauncher.Port "${launcherWhere}Port" 1 65535)
-                    JoinLinePattern  = & $asString $rawLauncher.JoinLinePattern "${launcherWhere}JoinLinePattern"
-                    ServerArguments  = & $asString $rawLauncher.ServerArguments "${launcherWhere}ServerArguments" -AllowEmpty
-                    ReadyLinePattern = & $asString $rawLauncher.ReadyLinePattern "${launcherWhere}ReadyLinePattern" -AllowEmpty
-                    ClientLaunch     = & $asString $rawLauncher.ClientLaunch "${launcherWhere}ClientLaunch" -AllowEmpty
-                    LocalHint        = & $asString $rawLauncher.LocalHint "${launcherWhere}LocalHint" -AllowEmpty
-                }
-                try {
-                    Assert-OgServerLauncherSettings -Title $serverLauncher.Title -Port $serverLauncher.Port `
-                        -ServerArguments $serverLauncher.ServerArguments -JoinLinePattern $serverLauncher.JoinLinePattern `
-                        -ReadyLinePattern $serverLauncher.ReadyLinePattern -ClientLaunch $serverLauncher.ClientLaunch `
-                        -LocalHint $serverLauncher.LocalHint -AppNames $allAppNames -Prefix $launcherWhere
-                }
-                catch {
-                    throw "Steam config '$configPath': $($_.Exception.Message)"
-                }
+            else {
+                $build = & $readBuild $rawDepot $depotWhere $depotName $allAppNames
+                $builds.Add($build)
+                $buildsByName[$depotName] = $build
+                $depotPath = '.'
             }
+            $null = $usedBuilds.Add($build.Name)
 
-            $depots.Add([pscustomobject]@{
-                    Name               = $depotName
-                    DepotId            = $depotId
-                    TargetType         = $targetType
-                    Configuration      = $configuration
-                    ExpectedExecutable = $expectedExecutable
-                    FileExclusions     = $fileExclusions
-                    ExtraFiles         = $extraFiles
-                    ServerLauncher     = $serverLauncher
-                    AppName            = $appName
-                    AppId              = $appId
-                })
+            $depot = [pscustomobject]@{
+                Name               = $depotName
+                DepotId            = $depotId
+                Build              = $build.Name
+                DepotPath          = $depotPath
+                TargetType         = $build.TargetType
+                Configuration      = $build.Configuration
+                ExpectedExecutable = $build.ExpectedExecutable
+                FileExclusions     = $build.FileExclusions
+                ExtraFiles         = $build.ExtraFiles
+                ServerLauncher     = $build.ServerLauncher
+                AppName            = $appName
+                AppId              = $appId
+            }
+            $depots.Add($depot)
+            $depotsByName[$depotName] = $depot
         }
 
         $apps.Add([pscustomobject]@{
@@ -312,6 +464,51 @@ function Import-OgSteamConfig {
                 AppId  = $appId
                 Depots = $depots.ToArray()
             })
+    }
+
+    foreach ($build in $builds) {
+        if (-not $usedBuilds.Contains($build.Name)) {
+            Write-Warning "Steam config '$configPath': build '$($build.Name)' ($($buildWhere[$build.Name])) is not used by any depot, so it is never packaged."
+        }
+    }
+
+    $profiles = [System.Collections.Generic.List[object]]::new()
+    $defaultProfile = ''
+    if ($raw.Contains('Profiles')) {
+        $rawProfiles = $raw.Profiles
+        if ($rawProfiles -isnot [System.Collections.IDictionary]) {
+            throw "Steam config '$configPath': 'Profiles' must be a hashtable."
+        }
+        if (-not $rawProfiles.Contains('Default')) {
+            throw "Steam config '$configPath': missing required key 'Profiles.Default'."
+        }
+        foreach ($key in @($rawProfiles.Keys | Where-Object { $_ -ne 'Default' } | Sort-Object)) {
+            $profileName = & $asName $key "Profiles.$key (profile name)"
+            $entries = & $asList $rawProfiles[$key] "Profiles.$profileName"
+            if ($entries.Count -eq 0) {
+                throw "Steam config '$configPath': 'Profiles.$profileName' must name at least one depot."
+            }
+            $members = [System.Collections.Generic.List[string]]::new()
+            for ($p = 0; $p -lt $entries.Count; $p++) {
+                $entryKey = "Profiles.$profileName[$p]"
+                $depotRef = & $asString $entries[$p] $entryKey
+                if (-not $depotsByName.ContainsKey($depotRef)) {
+                    throw "Steam config '$configPath': '$entryKey' names unknown depot '$depotRef'. Depots: $(@($depotsByName.Values | ForEach-Object Name) -join ', ')."
+                }
+                $canonical = $depotsByName[$depotRef].Name
+                if (-not $members.Contains($canonical)) { $members.Add($canonical) }
+            }
+            $profiles.Add([pscustomobject]@{
+                    Name   = $profileName
+                    Depots = $members.ToArray()
+                })
+        }
+        $defaultRef = & $asString $rawProfiles.Default 'Profiles.Default'
+        $defaultMatch = @($profiles | Where-Object { $_.Name -eq $defaultRef }) | Select-Object -First 1
+        if ($null -eq $defaultMatch) {
+            throw "Steam config '$configPath': 'Profiles.Default' names unknown profile '$defaultRef'. Profiles: $(@($profiles | ForEach-Object Name) -join ', ')."
+        }
+        $defaultProfile = $defaultMatch.Name
     }
 
     [pscustomobject]@{
@@ -324,6 +521,9 @@ function Import-OgSteamConfig {
         Branch         = $branch
         OutputRoot     = $outputRoot
         KeepLast       = [int]$keepLast
+        Builds         = $builds.ToArray()
         Apps           = $apps.ToArray()
+        Profiles       = $profiles.ToArray()
+        DefaultProfile = $defaultProfile
     }
 }
